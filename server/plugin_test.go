@@ -1,0 +1,354 @@
+// Copyright (c) 2017-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"testing"
+
+	jira "github.com/andygrunwald/go-jira"
+	"github.com/mattermost-community/mattermost-plugin-autolink/server/autolink"
+	"github.com/mattermost/mattermost/server/public/model"
+	"github.com/mattermost/mattermost/server/public/plugin"
+	"github.com/mattermost/mattermost/server/public/plugin/plugintest"
+	"github.com/mattermost/mattermost/server/public/plugin/plugintest/mock"
+	"github.com/mattermost/mattermost/server/public/pluginapi"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+const (
+	MockInstanceID = "mockInstanceID"
+	MockAPIToken   = "mockAPIToken"
+	MockAdminEmail = "mockadmin@email.com"
+	MockBaseURL    = "mockBaseURL"
+)
+
+func validRequestBody() io.ReadCloser {
+	f, err := os.Open("testdata/webhook-issue-created.json")
+	if err != nil {
+		panic(err)
+	}
+	return f
+}
+
+type TestConfiguration struct {
+	Secret   string
+	UserName string
+}
+
+func TestPlugin(t *testing.T) {
+	validConfiguration := TestConfiguration{
+		Secret: "thesecret",
+	}
+
+	for name, tc := range map[string]struct {
+		Configuration      TestConfiguration
+		Request            *http.Request
+		CreatePostError    *model.AppError
+		ExpectedStatusCode int
+	}{
+		"NoConfiguration": {
+			Configuration:      TestConfiguration{},
+			Request:            httptest.NewRequest("POST", "/webhook?team=theteam&channel=thechannel&secret=thesecret", validRequestBody()),
+			ExpectedStatusCode: http.StatusForbidden,
+		},
+		"NoChannel": {
+			Configuration:      validConfiguration,
+			Request:            httptest.NewRequest("POST", "/webhook?team=theteam&secret=thesecret", validRequestBody()),
+			ExpectedStatusCode: http.StatusBadRequest,
+		},
+		"NoTeam": {
+			Configuration:      validConfiguration,
+			Request:            httptest.NewRequest("POST", "/webhook?channel=thechannel&secret=thesecret", validRequestBody()),
+			ExpectedStatusCode: http.StatusBadRequest,
+		},
+		"WrongSecret": {
+			Configuration:      validConfiguration,
+			Request:            httptest.NewRequest("POST", "/webhook?team=theteam&channel=thechannel&secret=notthesecret", validRequestBody()),
+			ExpectedStatusCode: http.StatusForbidden,
+		},
+		"InvalidBody": {
+			Configuration:      validConfiguration,
+			Request:            httptest.NewRequest("POST", "/webhook?team=theteam&channel=thechannel&secret=thesecret", io.NopCloser(bytes.NewBufferString("foo"))),
+			ExpectedStatusCode: http.StatusBadRequest,
+		},
+		"UnknownJSONPayload": {
+			Configuration:      validConfiguration,
+			Request:            httptest.NewRequest("POST", "/webhook?team=theteam&channel=thechannel&secret=thesecret", io.NopCloser(bytes.NewBufferString("{}"))),
+			ExpectedStatusCode: http.StatusBadRequest,
+		},
+		"InvalidChannel": {
+			Configuration:      validConfiguration,
+			Request:            httptest.NewRequest("POST", "/webhook?team=theteam&channel=notthechannel&secret=thesecret", validRequestBody()),
+			ExpectedStatusCode: http.StatusBadRequest,
+		},
+		"InvalidTeam": {
+			Configuration:      validConfiguration,
+			Request:            httptest.NewRequest("POST", "/webhook?team=nottheteam&channel=thechannel&secret=thesecret", validRequestBody()),
+			ExpectedStatusCode: http.StatusBadRequest,
+		},
+		"ValidRequest": {
+			Configuration:      validConfiguration,
+			Request:            httptest.NewRequest("POST", "/webhook?team=theteam&channel=thechannel&secret=thesecret", validRequestBody()),
+			ExpectedStatusCode: http.StatusOK,
+		},
+		"CreatePostError": {
+			Configuration:      validConfiguration,
+			CreatePostError:    model.NewAppError("foo", "bar", nil, "", http.StatusInternalServerError),
+			Request:            httptest.NewRequest("POST", "/webhook?team=theteam&channel=thechannel&secret=thesecret", validRequestBody()),
+			ExpectedStatusCode: http.StatusInternalServerError,
+		},
+		"WrongMethod": {
+			Configuration:      validConfiguration,
+			Request:            httptest.NewRequest("GET", "/webhook", validRequestBody()),
+			ExpectedStatusCode: http.StatusMethodNotAllowed,
+		},
+		"WrongPath": {
+			Configuration:      validConfiguration,
+			Request:            httptest.NewRequest("POST", "/not-webhook", validRequestBody()),
+			ExpectedStatusCode: http.StatusNotFound,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			api := &plugintest.API{}
+
+			api.On("LogDebug", mockAnythingOfTypeBatch("string", 11)...).Return(nil)
+			api.On("LogWarn", mockAnythingOfTypeBatch("string", 10)...).Return(nil)
+			api.On("LogWarn", mockAnythingOfTypeBatch("string", 13)...).Return(nil)
+
+			api.On("KVGet", mock.AnythingOfType("string")).Return(make([]byte, 0), (*model.AppError)(nil))
+			api.On("KVSetWithOptions", mock.AnythingOfType("string"), mock.Anything, mock.Anything).Return(true, (*model.AppError)(nil))
+			api.On("GetDirectChannel", mockAnythingOfTypeBatch("string", 2)...).Return(
+				&model.Channel{}, (*model.AppError)(nil))
+			api.On("GetUserByUsername", "theuser").Return(&model.User{
+				Id: "theuserid",
+			}, (*model.AppError)(nil))
+			api.On("GetUserByUsername", "nottheuser").Return((*model.User)(nil), model.NewAppError("foo", "bar", nil, "", http.StatusBadRequest))
+
+			api.On("GetChannelByNameForTeamName", "nottheteam", "thechannel", false).Return((*model.Channel)(nil), model.NewAppError("foo", "bar", nil, "", http.StatusBadRequest))
+			api.On("GetChannelByNameForTeamName", "theteam", "notthechannel", false).Return((*model.Channel)(nil), model.NewAppError("foo", "bar", nil, "", http.StatusBadRequest))
+			api.On("GetChannelByNameForTeamName", "theteam", "thechannel", false).Run(func(args mock.Arguments) {
+				api.On("CreatePost", mock.AnythingOfType("*model.Post")).Return(&model.Post{}, tc.CreatePostError)
+			}).Return(&model.Channel{
+				Id:     "thechannelid",
+				TeamId: "theteamid",
+			}, (*model.AppError)(nil))
+
+			p := Plugin{}
+			p.updateConfig(func(conf *config) {
+				conf.Secret = tc.Configuration.Secret
+			})
+			p.SetAPI(api)
+			p.client = pluginapi.NewClient(api, p.Driver)
+			p.instanceStore = p.getMockInstanceStoreKV(1)
+			p.initializeRouter()
+
+			w := httptest.NewRecorder()
+			p.ServeHTTP(&plugin.Context{}, w, tc.Request)
+			assert.Equal(t, tc.ExpectedStatusCode, w.Result().StatusCode)
+		})
+	}
+}
+
+func TestSetupAutolink(t *testing.T) {
+	tests := []struct {
+		name         string
+		setup        func(*Plugin, *plugintest.API, *mockInstanceStore)
+		InstanceType InstanceType
+	}{
+		{
+			name: "Missing API token or Admin email",
+			setup: func(p *Plugin, mockAPI *plugintest.API, dummyInstanceStore *mockInstanceStore) {
+				mockAPI.On("LogInfo", "unable to setup autolink due to missing API Token or Admin Email").Return(nil).Times(1)
+				dummyInstanceStore.On("LoadInstance", mock.Anything).Return(&cloudInstance{}, nil).Times(1)
+
+				p.updateConfig(func(c *config) {
+					c.AdminAPIToken = ""
+					c.AdminEmail = ""
+				})
+			},
+			InstanceType: CloudInstanceType,
+		},
+		{
+			name: "Unsupported instance type",
+			setup: func(p *Plugin, mockAPI *plugintest.API, dummyInstanceStore *mockInstanceStore) {
+				mockAPI.On("LogInfo", "only cloud and cloud-oauth instances supported for autolink").Return(nil).Times(1)
+				dummyInstanceStore.On("LoadInstance", mock.Anything).Return(&serverInstance{}, nil).Times(1)
+
+				p.updateConfig(GetConfigSetterFunction())
+			},
+			InstanceType: ServerInstanceType,
+		},
+		{
+			name: "Autolink plugin unavailable API returned error",
+			setup: func(p *Plugin, mockAPI *plugintest.API, dummyInstanceStore *mockInstanceStore) {
+				mockAPI.On("LogWarn", "OnActivate: Autolink plugin unavailable. API returned error", "error", mock.Anything).Return(nil).Times(1)
+				mockAPI.On("GetPluginStatus", autolinkPluginID).Return(nil, &model.AppError{Message: "error getting plugin status"}).Times(1)
+				dummyInstanceStore.On("LoadInstance", mock.Anything).Return(&cloudInstance{}, nil).Times(1)
+
+				p.updateConfig(GetConfigSetterFunction())
+			},
+			InstanceType: CloudInstanceType,
+		},
+		{
+			name: "Autolink plugin not running",
+			setup: func(p *Plugin, mockAPI *plugintest.API, dummyInstanceStore *mockInstanceStore) {
+				mockAPI.On("LogWarn", "OnActivate: Autolink plugin unavailable. Plugin is not running", "status", &model.PluginStatus{State: model.PluginStateNotRunning}).Return(nil).Times(1)
+				mockAPI.On("GetPluginStatus", autolinkPluginID).Return(&model.PluginStatus{State: model.PluginStateNotRunning}, nil).Times(1)
+				dummyInstanceStore.On("LoadInstance", mock.Anything).Return(&cloudInstance{}, nil).Times(1)
+
+				p.updateConfig(GetConfigSetterFunction())
+			},
+			InstanceType: CloudInstanceType,
+		},
+		{
+			name: "Error installing autolinks for cloud instance",
+			setup: func(p *Plugin, mockAPI *plugintest.API, dummyInstanceStore *mockInstanceStore) {
+				mockAPI.On("LogWarn", "Error unmarshalling admin API token", "error", mock.Anything).Times(1)
+				mockAPI.On("LogInfo", "could not install autolinks for cloud instance", "instance", "mockBaseURL", "error", mock.Anything).Return(nil).Times(1)
+				mockAPI.On("GetPluginStatus", autolinkPluginID).Return(&model.PluginStatus{State: model.PluginStateRunning}, nil).Times(1)
+				dummyInstanceStore.On("LoadInstance", mock.Anything).Return(
+					&cloudInstance{
+						InstanceCommon: &InstanceCommon{
+							Plugin: p,
+						},
+						AtlassianSecurityContext: &AtlassianSecurityContext{
+							BaseURL: MockBaseURL,
+						},
+					}, nil).Times(1)
+
+				p.updateConfig(GetConfigSetterFunction())
+			},
+			InstanceType: CloudInstanceType,
+		},
+		{
+			name: "Error installing autolinks for cloud-oauth instance",
+			setup: func(p *Plugin, mockAPI *plugintest.API, dummyInstanceStore *mockInstanceStore) {
+				mockAPI.On("LogWarn", "Error unmarshalling admin API token", "error", mock.Anything).Times(1)
+				mockAPI.On("LogInfo", "could not install autolinks for cloud instance", "instance", "mockBaseURL", "error", mock.Anything).Return(nil).Times(1)
+				mockAPI.On("GetPluginStatus", autolinkPluginID).Return(&model.PluginStatus{State: model.PluginStateRunning}, nil).Times(1)
+
+				dummyInstanceStore.On("LoadInstance", mock.Anything).Return(
+					&cloudOAuthInstance{
+						InstanceCommon: &InstanceCommon{
+							Plugin: p,
+						},
+						JiraBaseURL: MockBaseURL,
+					}, nil).Times(1)
+
+				p.updateConfig(GetConfigSetterFunction())
+			},
+			InstanceType: CloudOAuthInstanceType,
+		},
+	}
+	for _, tt := range tests {
+		mockAPI := &plugintest.API{}
+		dummyInstanceStore := new(mockInstanceStore)
+		mockPluginClient := pluginapi.NewClient(mockAPI, nil)
+		p := &Plugin{
+			client:        mockPluginClient,
+			instanceStore: dummyInstanceStore,
+		}
+
+		t.Run(tt.name, func(t *testing.T) {
+			tt.setup(p, mockAPI, dummyInstanceStore)
+			instances := GetInstancesWithType(tt.InstanceType)
+
+			p.SetupAutolink(instances)
+
+			mockAPI.AssertExpectations(t)
+			dummyInstanceStore.AssertExpectations(t)
+		})
+	}
+}
+
+func TestAddAutoLinkForProjectsNormalizesBaseURL(t *testing.T) {
+	rawURL := "https://mmtest.atlassian.net///"
+	accessorURL := (&cloudInstance{
+		AtlassianSecurityContext: &AtlassianSecurityContext{BaseURL: rawURL},
+	}).GetJiraBaseURL()
+
+	for name, baseURL := range map[string]string{
+		"no trailing slash":         "https://mmtest.atlassian.net",
+		"trailing slash":            "https://mmtest.atlassian.net/",
+		"repeated trailing slashes": rawURL,
+		"normalized by accessor":    accessorURL,
+	} {
+		t.Run(name, func(t *testing.T) {
+			mockAPI := &plugintest.API{}
+			var installed []autolink.Autolink
+			mockAPI.On("PluginHTTP", mock.AnythingOfType("*http.Request")).Return(
+				&http.Response{StatusCode: http.StatusOK, Body: http.NoBody},
+			).Run(func(args mock.Arguments) {
+				req := args.Get(0).(*http.Request)
+				body, err := io.ReadAll(req.Body)
+				require.NoError(t, err)
+
+				var link autolink.Autolink
+				require.NoError(t, json.Unmarshal(body, &link))
+				installed = append(installed, link)
+			})
+
+			p := &Plugin{}
+			p.SetAPI(mockAPI)
+
+			require.NoError(t, p.AddAutoLinkForProjects(jira.ProjectList{{Key: "TES"}}, baseURL))
+
+			require.Len(t, installed, 2)
+			for _, link := range installed {
+				assert.NotContains(t, link.Template, "net//browse/")
+				assert.Contains(t, link.Template, "https://mmtest.atlassian.net/browse/TES-${jira_id}")
+			}
+			assert.Contains(t, installed[1].Pattern, `https://mmtest\.atlassian\.net/browse/`)
+		})
+	}
+}
+
+func GetConfigSetterFunction() func(*config) {
+	return func(c *config) {
+		c.AdminAPIToken = MockAPIToken
+		c.AdminEmail = MockAdminEmail
+	}
+}
+
+func GetInstancesWithType(instanceType InstanceType) *Instances {
+	return NewInstances(&InstanceCommon{
+		InstanceID: MockInstanceID,
+		Type:       instanceType,
+	})
+}
+
+func TestGenerateSecretIsURLSafe(t *testing.T) {
+	// Test multiple times to ensure consistent URL-safe character generation
+	for i := 0; i < 1000; i++ {
+		secret, err := generateSecret()
+		assert.NoError(t, err)
+
+		// Verify the secret has the correct length
+		assert.Equal(t, 32, len(secret), "Secret should be 32 characters long")
+
+		// Verify no URL-unsafe characters (+ and /) are present
+		// These characters cause issues when used in URL query parameters
+		// as they get URL-encoded/decoded differently by different systems
+		assert.NotContains(t, secret, "+", "Secret should not contain '+' character (not URL-safe)")
+		assert.NotContains(t, secret, "/", "Secret should not contain '/' character (not URL-safe)")
+
+		// Verify the secret only contains valid base64 URL-safe characters
+		// Valid characters: A-Z, a-z, 0-9, -, _
+		for _, char := range secret {
+			isValid := (char >= 'A' && char <= 'Z') ||
+				(char >= 'a' && char <= 'z') ||
+				(char >= '0' && char <= '9') ||
+				char == '-' ||
+				char == '_'
+			assert.True(t, isValid, "Secret contains invalid character: %c", char)
+		}
+	}
+}

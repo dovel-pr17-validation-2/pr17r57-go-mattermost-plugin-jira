@@ -1,0 +1,26 @@
+name: ci
+on:
+  schedule:
+    - cron: "0 0 * * *"
+  push:
+    branches:
+      - master
+    tags:
+      - "v*"
+  pull_request:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  plugin-ci:
+    uses: mattermost/actions-workflows/.github/workflows/plugin-ci.yml@main
+    secrets: inherit
+
+  dist:
+    uses: mattermost/actions-workflows/.github/workflows/plugin-dist-pr.yml@main
+    secrets: inherit
+    with:
+      dist-target: "dist"
+      s3-prefix: "mattermost-plugin-jira"

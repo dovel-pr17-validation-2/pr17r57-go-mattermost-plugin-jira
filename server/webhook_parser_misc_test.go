@@ -1,0 +1,463 @@
+// Copyright (c) 2017-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+package main
+
+import (
+	"fmt"
+	"io"
+	"os"
+	"strings"
+	"testing"
+
+	jira "github.com/andygrunwald/go-jira"
+	"github.com/mattermost/mattermost/server/public/model"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/mattermost/mattermost-plugin-jira/server/utils/types"
+)
+
+func TestParseWebhookRejectsEmptyPayloads(t *testing.T) {
+	for _, body := range []string{"null", " null\n", "{}"} {
+		t.Run(fmt.Sprintf("%q", body), func(t *testing.T) {
+			var wh Webhook
+			var err error
+			require.NotPanics(t, func() {
+				wh, err = ParseWebhook([]byte(body))
+			})
+			require.Error(t, err)
+			require.Nil(t, wh)
+		})
+	}
+}
+
+func TestMarkdown(t *testing.T) {
+	f, err := os.Open("testdata/webhook-issue-created.json")
+	require.NoError(t, err)
+	defer f.Close()
+	bb, err := io.ReadAll(f)
+	require.Nil(t, err)
+	wh, err := ParseWebhook(bb)
+	require.NoError(t, err)
+	w := wh.(*webhook)
+	require.NotNil(t, w)
+	require.Equal(t,
+		"Test User **created** story [TES-41: Unit test summary](https://some-instance-test.atlassian.net/browse/TES-41)",
+		w.headline)
+}
+
+func TestEventTypeFormat(t *testing.T) {
+	for _, value := range map[string]struct {
+		filename string
+		expected string
+	}{
+		"issue created format":                        {"testdata/webhook-issue-created.json", "Test User **created** story"},
+		"issue updated assigned format":               {"testdata/webhook-issue-updated-assigned.json", "Test User **assigned** Test User to story"},
+		"issue updated reopened format":               {"testdata/webhook-issue-updated-reopened.json", "Test User **updated** story"},
+		"issue updated reopened format one changelog": {"testdata/webhook-issue-updated-reopened-one-changelog.json", "Test User **reopened** story"},
+		"issue updated resolved format":               {"testdata/webhook-issue-updated-resolved.json", "Test User **updated** story"},
+		"issue updated resolved format one changelog": {"testdata/webhook-issue-updated-resolved-one-changelog.json", "Test User **resolved** story"},
+		"issue deleted":                               {"testdata/webhook-issue-deleted.json", "Test User **deleted** task"},
+		"issue updated commented created":             {"testdata/webhook-server-issue-updated-commented-3.json", "Test User **commented** on improvement"},
+		"issue updated comment edited":                {"testdata/webhook-server-issue-updated-comment-edited.json", "Lev Brouk **edited comment** in story"},
+		"issue updated comment deleted":               {"testdata/webhook-server-issue-updated-comment-deleted.json", "Lev Brouk **deleted comment** in story"},
+	} {
+		f, err := os.Open(value.filename)
+		require.NoError(t, err)
+		defer f.Close()
+		bb, err := io.ReadAll(f)
+		require.Nil(t, err)
+		wh, err := ParseWebhook(bb)
+		require.NoError(t, err)
+		w := wh.(*webhook)
+		require.NotNil(t, w)
+		require.Contains(t, w.headline, value.expected)
+	}
+}
+
+func TestNotificationsFormat(t *testing.T) {
+	for _, value := range map[string]struct {
+		filename string
+		expected string
+	}{
+		"issue updated commented created": {"testdata/webhook-server-issue-updated-commented-3.json", "Test User **mentioned** you in a new comment on improvement"},
+	} {
+		f, err := os.Open(value.filename)
+		require.NoError(t, err)
+		defer f.Close()
+		bb, err := io.ReadAll(f)
+		require.Nil(t, err)
+		wh, err := ParseWebhook(bb)
+		require.NoError(t, err)
+		w := wh.(*webhook)
+		require.NotNil(t, w)
+		require.NotNil(t, w.notifications)
+		require.Contains(t, w.notifications[0].message, value.expected)
+	}
+}
+
+func TestWebhookVariousErrors(t *testing.T) {
+	assert.Equal(t, "", mdUser(nil))
+
+	wh := &webhook{
+		JiraWebhook: &JiraWebhook{
+			Issue: jira.Issue{
+				Fields: &jira.IssueFields{},
+			},
+		},
+	}
+
+	assert.Equal(t, "", wh.mdJiraLink("test", "/test"))
+	assert.Equal(t, "", wh.mdIssueDescription())
+	assert.Equal(t, "", wh.mdIssueSummary())
+	assert.Equal(t, Nobody, wh.mdIssueAssignee())
+	assert.Equal(t, "", wh.mdIssueType())
+	assert.Equal(t, " ", wh.mdSummaryLink())
+	assert.Equal(t, " ", wh.mdKeyLink())
+	assert.Equal(t, "Someone", wh.mdUser())
+}
+
+func TestMdUserFallback(t *testing.T) {
+	assert.Equal(t, "", mdUser(nil))
+	assert.Equal(t, "Someone", mdUser(&jira.User{}))
+	assert.Equal(t, "John Doe", mdUser(&jira.User{DisplayName: "John Doe"}))
+	assert.Equal(t, "jdoe", mdUser(&jira.User{Name: "jdoe"}))
+	assert.Equal(t, "abc123", mdUser(&jira.User{AccountID: "abc123"}))
+	assert.Equal(t, "JIRAUSER123", mdUser(&jira.User{Key: "JIRAUSER123"}))
+	assert.Equal(t, "jdoe@example.com", mdUser(&jira.User{EmailAddress: "jdoe@example.com"}))
+	assert.Equal(t, "John Doe", mdUser(&jira.User{DisplayName: "John Doe", Name: "jdoe", EmailAddress: "jdoe@example.com"}))
+	assert.Equal(t, "jdoe", mdUser(&jira.User{Name: "jdoe", AccountID: "abc123"}))
+
+	// Whitespace-only values should be skipped
+	assert.Equal(t, "Someone", mdUser(&jira.User{DisplayName: "   ", Name: "  "}))
+	assert.Equal(t, "jdoe", mdUser(&jira.User{DisplayName: "  ", Name: "jdoe"}))
+}
+
+func TestTruncate(t *testing.T) {
+	assert.Equal(t, "12345", truncate("12345", 5))
+	assert.Equal(t, "12345", truncate("12345", 6))
+	assert.Equal(t, "1...", truncate("12345", 4))
+	assert.Equal(t, "12", truncate("12345", 2))
+	assert.Equal(t, "1", truncate("12345", 1))
+	assert.Equal(t, "", truncate("12345", 0))
+	assert.Equal(t, "12345", truncate("12345", -1))
+}
+
+func TestQuoteIssueComment(t *testing.T) {
+	assert.Equal(t, "> test comment", quoteIssueComment("test comment"))
+	assert.Equal(t, "> line1\n> line2", quoteIssueComment("line1\nline2"))
+	assert.Equal(t, "", quoteIssueComment(""))
+	assert.Equal(t, "", quoteIssueComment("   "))
+	assert.Equal(t, "", quoteIssueComment("\n\t"))
+}
+
+func TestJiraLink(t *testing.T) {
+	var jwh JiraWebhook
+	jwh.Issue.Self = "http://localhost:8080/rest/api/2/issue/10006"
+	assert.Equal(t, "[1](http://localhost:8080/XXX)", jwh.mdJiraLink("1", "/XXX"))
+
+	jwh.Issue.Self = "http://localhost:8080/foo/bar/rest/api/2/issue/10006"
+	assert.Equal(t, "[1](http://localhost:8080/foo/bar/QWERTY)", jwh.mdJiraLink("1", "/QWERTY"))
+}
+
+func TestWebhookQuotedComment(t *testing.T) {
+	for _, value := range []string{
+		"testdata/webhook-server-issue-updated-commented-3.json",
+		"testdata/webhook-server-issue-updated-comment-edited.json",
+	} {
+		f, err := os.Open(value)
+		require.NoError(t, err)
+		defer f.Close()
+		bb, err := io.ReadAll(f)
+		require.Nil(t, err)
+		wh, err := ParseWebhook(bb)
+		require.NoError(t, err)
+		w := wh.(*webhook)
+		require.NotNil(t, w)
+		assert.True(t, strings.HasPrefix(w.text, ">"))
+	}
+}
+
+func TestPreProcessText(t *testing.T) {
+	tests := map[string]struct {
+		input          string
+		expectedOutput string
+	}{
+		"BOLD formatting": {
+			input:          "*BOLD*",
+			expectedOutput: "**BOLD**",
+		},
+		"STRIKETHROUGH formatting": {
+			input:          "-STRIKETHROUGH-",
+			expectedOutput: "~~STRIKETHROUGH~~",
+		},
+		"Colored text formatting": {
+			input:          "{color:#ff5630}RED{color} {color:#4c9aff}BLUE{color} {color:#36b37e}GREEN{color}",
+			expectedOutput: "RED BLUE GREEN",
+		},
+		"Numbered list with mixed content formatting": {
+			input: `# NUMBERED LIST ROW 1
+# NUMBERED LIST ROW 2
+non-numbered list text
+# NUMBERED LIST ROW 1`,
+			expectedOutput: `1. NUMBERED LIST ROW 1
+2. NUMBERED LIST ROW 2
+non-numbered list text
+1. NUMBERED LIST ROW 1`,
+		},
+		"Code block formatting": {
+			input:          "{code:go}fruit := \"APPLE\"{code}",
+			expectedOutput: "`fruit := \"APPLE\"`",
+		},
+		"Bullet list formatting": {
+			input: `* BULLET LIST ROW 1
+* BULLET LIST ROW 2`,
+			expectedOutput: `* BULLET LIST ROW 1
+* BULLET LIST ROW 2`,
+		},
+		"Heading formatting": {
+			input: `h1. HEADING 1
+h2. HEADING 2
+h3. HEADING 3
+h4. HEADING 4
+h5. HEADING 5
+h6. HEADING 6`,
+			expectedOutput: `# HEADING 1
+## HEADING 2
+### HEADING 3
+#### HEADING 4
+##### HEADING 5
+###### HEADING 6`,
+		},
+		"Link formatting with text": {
+			input:          "[www.googlesd.com|http://www.googlesd.com]",
+			expectedOutput: "[www.googlesd.com](http://www.googlesd.com)",
+		},
+		"Link formatting with smart-link": {
+			input:          "[http://www.google.com|http://www.google.com|smart-link]",
+			expectedOutput: "[http://www.google.com](http://www.google.com)",
+		},
+		"Link formatting with title": {
+			input:          "[google|http://www.google.com]",
+			expectedOutput: "[google](http://www.google.com)",
+		},
+		"Quote formatting": {
+			input:          "{quote}This is a quote{quote}",
+			expectedOutput: "> This is a quote",
+		},
+		"No-format block": {
+			input:          "{noformat}This is not formatted{noformat}",
+			expectedOutput: "`This is not formatted`",
+		},
+		"Double curly block": {
+			input:          "{{This is a code block}}",
+			expectedOutput: "`This is a code block`",
+		},
+		"Multi-line language specific code block": {
+			input: `{code:go}func main() {
+    fmt.Println("Hello, World!")
+}{code}`,
+			expectedOutput: "\n`func main() {`\n`    fmt.Println(\"Hello, World!\")`\n`}`\n",
+		},
+		"Multi-line noformat code block": {
+			input: `{noformat}text data in code block.
+more text data in code block.{noformat}`,
+			expectedOutput: "\n`text data in code block.`\n`more text data in code block.`\n",
+		},
+		"User mentioned with account ID": {
+			input:          "[~accountid:712020:46403440-d0cf-4f7f-993f-1035facb10a2]",
+			expectedOutput: "[~accountid:712020:46403440-d0cf-4f7f-993f-1035facb10a2]",
+		},
+		"Hyphenated word with account ID": {
+			input:          "-word- [~accountid:712020:46403440-d0cf-4f7f-993f-1035facb10a2] -anotherWord-",
+			expectedOutput: "~~word~~ [~accountid:712020:46403440-d0cf-4f7f-993f-1035facb10a2] ~~anotherWord~~",
+		},
+		"Account ID within sentence": {
+			input:          "This is an account ID: [~accountid:712020:46403440-d0cf-4f7f-993f-1035facb10a2], and this -should be struck-",
+			expectedOutput: "This is an account ID: [~accountid:712020:46403440-d0cf-4f7f-993f-1035facb10a2], and this ~~should be struck~~",
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			actualOutput := preProcessText(tc.input)
+			assert.Equal(t, tc.expectedOutput, actualOutput)
+		})
+	}
+}
+
+func TestNotificationDedupKey(t *testing.T) {
+	makeWebhook := func(issueKey string) *webhook {
+		return &webhook{
+			JiraWebhook: &JiraWebhook{
+				Issue: jira.Issue{Key: issueKey},
+			},
+		}
+	}
+
+	const instanceID = types.ID("https://jira.example.com")
+
+	t.Run("same instance, issue, recipient and message produce the same key", func(t *testing.T) {
+		wh1 := makeWebhook("PROJ-1")
+		wh2 := makeWebhook("PROJ-1")
+		assert.Equal(t,
+			notificationDedupKey(instanceID, wh1, "user-abc", "Actor **assigned** you to PROJ-1"),
+			notificationDedupKey(instanceID, wh2, "user-abc", "Actor **assigned** you to PROJ-1"))
+	})
+
+	t.Run("different events producing identical notifications still dedup", func(t *testing.T) {
+		whCreated := &webhook{JiraWebhook: &JiraWebhook{
+			WebhookEvent: "jira:issue_created",
+			Issue:        jira.Issue{Key: "PROJ-1"},
+		}}
+		whAssigned := &webhook{JiraWebhook: &JiraWebhook{
+			WebhookEvent:       "jira:issue_updated",
+			IssueEventTypeName: "issue_assigned",
+			Issue:              jira.Issue{Key: "PROJ-1"},
+		}}
+		msg := "Actor **assigned** you to PROJ-1"
+		assert.Equal(t,
+			notificationDedupKey(instanceID, whCreated, "user-abc", msg),
+			notificationDedupKey(instanceID, whAssigned, "user-abc", msg))
+	})
+
+	t.Run("different instances produce different keys", func(t *testing.T) {
+		wh := makeWebhook("PROJ-1")
+		msg := "Actor **assigned** you to PROJ-1"
+		assert.NotEqual(t,
+			notificationDedupKey(types.ID("https://jira-a.example.com"), wh, "user-abc", msg),
+			notificationDedupKey(types.ID("https://jira-b.example.com"), wh, "user-abc", msg))
+	})
+
+	t.Run("different recipients produce different keys", func(t *testing.T) {
+		wh := makeWebhook("PROJ-1")
+		msg := "Actor **assigned** you to PROJ-1"
+		assert.NotEqual(t,
+			notificationDedupKey(instanceID, wh, "user-abc", msg),
+			notificationDedupKey(instanceID, wh, "user-xyz", msg))
+	})
+
+	t.Run("different issues produce different keys", func(t *testing.T) {
+		msg := "Actor **assigned** you to %s"
+		assert.NotEqual(t,
+			notificationDedupKey(instanceID, makeWebhook("PROJ-1"), "user-abc", fmt.Sprintf(msg, "PROJ-1")),
+			notificationDedupKey(instanceID, makeWebhook("PROJ-2"), "user-abc", fmt.Sprintf(msg, "PROJ-2")))
+	})
+
+	t.Run("different messages produce different keys", func(t *testing.T) {
+		wh := makeWebhook("PROJ-1")
+		assert.NotEqual(t,
+			notificationDedupKey(instanceID, wh, "user-abc", "Actor **assigned** you to PROJ-1"),
+			notificationDedupKey(instanceID, wh, "user-abc", "Actor **commented** on PROJ-1"))
+	})
+
+	t.Run("values containing separator-like characters do not collide", func(t *testing.T) {
+		// A naive "_"-joined encoding would make ("user-abc", "extra_hello")
+		// collide with ("user-abc_extra", "hello"). The length-prefixed encoding
+		// must keep these distinct.
+		wh := makeWebhook("PROJ-1")
+		assert.NotEqual(t,
+			notificationDedupKey(instanceID, wh, "user-abc", "extra_hello"),
+			notificationDedupKey(instanceID, wh, "user-abc_extra", "hello"))
+
+		// Same idea across the issue key/recipient boundary.
+		assert.NotEqual(t,
+			notificationDedupKey(instanceID, makeWebhook("PROJ-1_user"), "abc", "hello"),
+			notificationDedupKey(instanceID, makeWebhook("PROJ-1"), "user_abc", "hello"))
+	})
+}
+
+func TestChannelPostDedupKey(t *testing.T) {
+	makeWebhook := func(issueKey, headline, text string, fields []*model.SlackAttachmentField) *webhook {
+		return &webhook{
+			JiraWebhook: &JiraWebhook{
+				Issue: jira.Issue{Key: issueKey},
+			},
+			headline: headline,
+			text:     text,
+			fields:   fields,
+		}
+	}
+
+	const instanceID = types.ID("https://jira.example.com")
+
+	t.Run("same instance, issue, channel and content produce the same key", func(t *testing.T) {
+		wh1 := makeWebhook("PROJ-1", "Actor **commented** on PROJ-1", "some comment", nil)
+		wh2 := makeWebhook("PROJ-1", "Actor **commented** on PROJ-1", "some comment", nil)
+		assert.Equal(t,
+			channelPostDedupKey(instanceID, wh1, "channel-abc"),
+			channelPostDedupKey(instanceID, wh2, "channel-abc"))
+	})
+
+	t.Run("different channels produce different keys", func(t *testing.T) {
+		wh := makeWebhook("PROJ-1", "Actor **commented** on PROJ-1", "some comment", nil)
+		assert.NotEqual(t,
+			channelPostDedupKey(instanceID, wh, "channel-abc"),
+			channelPostDedupKey(instanceID, wh, "channel-xyz"))
+	})
+
+	t.Run("different instances produce different keys", func(t *testing.T) {
+		wh := makeWebhook("PROJ-1", "Actor **commented** on PROJ-1", "some comment", nil)
+		assert.NotEqual(t,
+			channelPostDedupKey(types.ID("https://jira-a.example.com"), wh, "channel-abc"),
+			channelPostDedupKey(types.ID("https://jira-b.example.com"), wh, "channel-abc"))
+	})
+
+	t.Run("different issues produce different keys", func(t *testing.T) {
+		assert.NotEqual(t,
+			channelPostDedupKey(instanceID, makeWebhook("PROJ-1", "headline", "text", nil), "channel-abc"),
+			channelPostDedupKey(instanceID, makeWebhook("PROJ-2", "headline", "text", nil), "channel-abc"))
+	})
+
+	t.Run("different headlines produce different keys", func(t *testing.T) {
+		assert.NotEqual(t,
+			channelPostDedupKey(instanceID, makeWebhook("PROJ-1", "Actor **commented** on PROJ-1", "text", nil), "channel-abc"),
+			channelPostDedupKey(instanceID, makeWebhook("PROJ-1", "Actor **updated** PROJ-1", "text", nil), "channel-abc"))
+	})
+
+	t.Run("different text produce different keys", func(t *testing.T) {
+		assert.NotEqual(t,
+			channelPostDedupKey(instanceID, makeWebhook("PROJ-1", "headline", "first comment", nil), "channel-abc"),
+			channelPostDedupKey(instanceID, makeWebhook("PROJ-1", "headline", "second comment", nil), "channel-abc"))
+	})
+
+	t.Run("different fields produce different keys", func(t *testing.T) {
+		wh1 := makeWebhook("PROJ-1", "headline", "text", []*model.SlackAttachmentField{{Title: "Priority", Value: "High"}})
+		wh2 := makeWebhook("PROJ-1", "headline", "text", []*model.SlackAttachmentField{{Title: "Priority", Value: "Low"}})
+		assert.NotEqual(t,
+			channelPostDedupKey(instanceID, wh1, "channel-abc"),
+			channelPostDedupKey(instanceID, wh2, "channel-abc"))
+	})
+
+	t.Run("different field Short flags produce different keys", func(t *testing.T) {
+		wh1 := makeWebhook("PROJ-1", "headline", "text", []*model.SlackAttachmentField{{Title: "Priority", Value: "High", Short: true}})
+		wh2 := makeWebhook("PROJ-1", "headline", "text", []*model.SlackAttachmentField{{Title: "Priority", Value: "High", Short: false}})
+		assert.NotEqual(t,
+			channelPostDedupKey(instanceID, wh1, "channel-abc"),
+			channelPostDedupKey(instanceID, wh2, "channel-abc"))
+	})
+
+	t.Run("values containing separator-like characters do not collide", func(t *testing.T) {
+		// A naive "_"-joined encoding would make ("A_B", "C") collide with ("A", "B_C").
+		// The length-prefixed encoding must keep these distinct.
+		wh1 := makeWebhook("PROJ-1", "A_B", "C", nil)
+		wh2 := makeWebhook("PROJ-1", "A", "B_C", nil)
+		assert.NotEqual(t,
+			channelPostDedupKey(instanceID, wh1, "channel-abc"),
+			channelPostDedupKey(instanceID, wh2, "channel-abc"))
+
+		// Same idea across the channelID/headline boundary.
+		wh3 := makeWebhook("PROJ-1", "B", "text", nil)
+		assert.NotEqual(t,
+			channelPostDedupKey(instanceID, wh3, "channel-abc_extra"),
+			channelPostDedupKey(instanceID, makeWebhook("PROJ-1", "extra_B", "text", nil), "channel-abc"))
+
+		// And across a field's title/value boundary.
+		wh4 := makeWebhook("PROJ-1", "headline", "text", []*model.SlackAttachmentField{{Title: "A=B", Value: "C"}})
+		wh5 := makeWebhook("PROJ-1", "headline", "text", []*model.SlackAttachmentField{{Title: "A", Value: "B=C"}})
+		assert.NotEqual(t,
+			channelPostDedupKey(instanceID, wh4, "channel-abc"),
+			channelPostDedupKey(instanceID, wh5, "channel-abc"))
+	})
+}

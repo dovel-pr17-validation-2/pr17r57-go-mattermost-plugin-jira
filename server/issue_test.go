@@ -1,0 +1,2384 @@
+// Copyright (c) 2017-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+package main
+
+import (
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"testing"
+
+	jira "github.com/andygrunwald/go-jira"
+	"github.com/mattermost/mattermost/server/public/model"
+	"github.com/mattermost/mattermost/server/public/plugin"
+	"github.com/mattermost/mattermost/server/public/plugin/plugintest"
+	"github.com/mattermost/mattermost/server/public/plugin/plugintest/mock"
+	"github.com/mattermost/mattermost/server/public/pluginapi"
+	"github.com/pkg/errors"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/trivago/tgo/tcontainer"
+
+	"github.com/mattermost/mattermost-plugin-jira/server/utils/kvstore"
+	"github.com/mattermost/mattermost-plugin-jira/server/utils/types"
+)
+
+const (
+	nonExistantIssueKey   = "FAKE-1"
+	noPermissionsIssueKey = "SUDO-1"
+	attachCommentErrorKey = "ATTACH-1"
+	existingIssueKey      = "REAL-1"
+	nonExistantProjectKey = "FP"
+	noIssueFoundError     = "We couldn't find the issue key. Please confirm the issue key and try again. You may not have permissions to access this issue."
+	noPermissionsError    = "You do not have the appropriate permissions to perform this action. Please contact your Jira administrator."
+
+	// Only this query yields autocomplete suggestions, so tests that do not opt
+	// in keep falling through to the manually configured team list.
+	autocompleteTeamQuery = "discoverable-team"
+)
+
+type testClient struct {
+	RESTService
+	UserService
+	ProjectService
+	SearchService
+	IssueService
+}
+
+func (client testClient) ListFields() ([]JiraField, error) { return nil, nil }
+
+func (client testClient) SearchAutoCompleteFields(params map[string]string) (*AutoCompleteResult, error) {
+	if params["fieldValue"] != autocompleteTeamQuery {
+		return &AutoCompleteResult{}, nil
+	}
+
+	return &AutoCompleteResult{
+		Results: []Result{{Value: "discovered-1", DisplayName: "Discovered Team"}},
+	}, nil
+}
+
+func (client testClient) GetProject(key string) (*jira.Project, error) {
+	if key == nonExistantProjectKey {
+		return nil, errors.New("Project " + key + " not found")
+	}
+	return &jira.Project{
+		Key:  key,
+		Name: "Test Project",
+	}, nil
+}
+
+func (client testClient) GetTransitions(issueKey string) ([]jira.Transition, error) {
+	if issueKey == nonExistantIssueKey {
+		return []jira.Transition{}, errors.New(noIssueFoundError)
+	} else if issueKey == noPermissionsIssueKey {
+		return []jira.Transition{}, nil
+	}
+
+	return []jira.Transition{
+		{To: jira.Status{Name: "To Do"}},
+		{To: jira.Status{Name: "In Progress"}},
+		{To: jira.Status{Name: "In Testing"}},
+	}, nil
+}
+
+func (client testClient) DoTransition(issueKey string, transitionID string) error {
+	return nil
+}
+
+func (client testClient) GetIssue(issueKey string, options *jira.GetQueryOptions) (*jira.Issue, error) {
+	if issueKey == nonExistantIssueKey {
+		return nil, kvstore.ErrNotFound
+	}
+	return &jira.Issue{
+		Key: issueKey,
+		Fields: &jira.IssueFields{
+			Summary:  "Test Issue Summary",
+			Reporter: &jira.User{},
+			Status:   &jira.Status{},
+		},
+	}, nil
+}
+
+func (client testClient) AddComment(issueKey string, comment *jira.Comment) (*jira.Comment, error) {
+	if issueKey == noPermissionsIssueKey {
+		return nil, errors.New("you do not have the permission to comment on this issue")
+	} else if issueKey == attachCommentErrorKey {
+		return nil, errors.New("unanticipated error")
+	}
+
+	return nil, nil
+}
+
+func setupTestPlugin(api *plugintest.API) *Plugin {
+	api.On("LogError", mockAnythingOfTypeBatch("string", 13)...).Return()
+	api.On("LogDebug", mockAnythingOfTypeBatch("string", 11)...).Return()
+
+	p := &Plugin{}
+	p.SetAPI(api)
+	p.initializeRouter()
+	p.instanceStore = p.getMockInstanceStoreKV(1)
+	p.userStore = getMockUserStoreKV()
+	p.client = pluginapi.NewClient(api, p.Driver)
+	p.updateConfig(func(conf *config) {
+		conf.Secret = someSecret
+	})
+
+	return p
+}
+
+func addActionSignatureToRequest(p *Plugin, req *model.PostActionIntegrationRequest) {
+	if req == nil {
+		return
+	}
+	if req.Context == nil {
+		req.Context = map[string]interface{}{}
+	}
+
+	issueKey, ok := req.Context["issue_key"].(string)
+	if !ok {
+		return
+	}
+	instanceID, ok := req.Context["instance_id"].(string)
+	if !ok {
+		return
+	}
+
+	if sig := p.generatePostActionSignature(strings.TrimSpace(issueKey), strings.TrimSpace(instanceID)); sig != "" {
+		req.Context["action_signature"] = sig
+	}
+}
+
+func TestBuildPostActionContext(t *testing.T) {
+	channelID := model.NewId()
+	postID := "missing-post"
+	instanceID := "instance-id"
+	issueKey := "MM-123"
+	authenticatedUserID := "user-id"
+
+	makeRequest := func(issue string) model.PostActionIntegrationRequest {
+		return model.PostActionIntegrationRequest{
+			ChannelId: channelID,
+			PostId:    postID,
+			Context: map[string]interface{}{
+				"issue_key":   issue,
+				"instance_id": instanceID,
+			},
+		}
+	}
+
+	t.Run("falls back to channel membership when post not stored", func(t *testing.T) {
+		api := &plugintest.API{}
+		api.On("GetPost", postID).Return((*model.Post)(nil), model.NewAppError("GetPost", "not_found", nil, "", http.StatusNotFound))
+		api.On("GetChannelMember", channelID, authenticatedUserID).Return(&model.ChannelMember{}, (*model.AppError)(nil))
+
+		plg := &Plugin{}
+		plg.SetAPI(api)
+		plg.client = pluginapi.NewClient(api, plg.Driver)
+		plg.updateConfig(func(conf *config) {
+			conf.botUserID = "bot-user"
+			conf.Secret = someSecret
+		})
+
+		req := makeRequest(issueKey)
+		addActionSignatureToRequest(plg, &req)
+
+		ctx, status, msg := plg.buildPostActionContext(authenticatedUserID, req, false)
+		assert.Equal(t, 0, status)
+		assert.Equal(t, "", msg)
+		assert.Equal(t, channelID, ctx.channelID)
+		assert.Equal(t, strings.ToUpper(issueKey), ctx.issueKey)
+		assert.Equal(t, instanceID, ctx.instanceID)
+
+		api.AssertExpectations(t)
+	})
+
+	t.Run("requires stored post when flag is set", func(t *testing.T) {
+		api := &plugintest.API{}
+		api.On("GetPost", postID).Return((*model.Post)(nil), model.NewAppError("GetPost", "not_found", nil, "", http.StatusNotFound))
+
+		plg := &Plugin{}
+		plg.SetAPI(api)
+		plg.client = pluginapi.NewClient(api, plg.Driver)
+		plg.updateConfig(func(conf *config) {
+			conf.botUserID = "bot-user"
+			conf.Secret = someSecret
+		})
+
+		req := makeRequest(issueKey)
+		addActionSignatureToRequest(plg, &req)
+
+		ctx, status, msg := plg.buildPostActionContext(authenticatedUserID, req, true)
+		assert.Nil(t, ctx)
+		assert.Equal(t, http.StatusNotFound, status)
+		assert.Equal(t, "post not found", msg)
+
+		api.AssertExpectations(t)
+	})
+}
+
+func (client testClient) GetCreateMetaInfo(api plugin.API, options *jira.GetQueryOptions) (*jira.CreateMetaInfo, error) {
+	return &jira.CreateMetaInfo{
+		Projects: []*jira.MetaProject{
+			{
+				IssueTypes: []*jira.MetaIssueType{
+					{
+						Fields: tcontainer.MarshalMap{
+							"security": tcontainer.MarshalMap{
+								"allowedValues": []interface{}{
+									tcontainer.MarshalMap{
+										"id": "10001",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}, nil
+}
+
+func (client testClient) CreateIssue(issue *jira.Issue) (*jira.Issue, error) {
+	// Return a mock created issue
+	return &jira.Issue{
+		ID:  "10001",
+		Key: "TEST-1",
+		Fields: &jira.IssueFields{
+			Summary: issue.Fields.Summary,
+			Project: issue.Fields.Project,
+			Type:    issue.Fields.Type,
+		},
+	}, nil
+}
+
+func TestTransitionJiraIssue(t *testing.T) {
+	api := &plugintest.API{}
+	api.On("SendEphemeralPost", mock.AnythingOfType("string"), mock.AnythingOfType("*model.Post")).Return(&model.Post{})
+
+	p := setupTestPlugin(api)
+
+	for name, tt := range map[string]struct {
+		issueKey    string
+		toState     string
+		expectedMsg string
+		expectedErr error
+	}{
+		"Transitioning a non existent issue": {
+			issueKey:    nonExistantIssueKey,
+			toState:     "To Do",
+			expectedMsg: "",
+			expectedErr: errors.New(noIssueFoundError),
+		},
+		"Transitioning an issue where user does not have access": {
+			issueKey:    noPermissionsIssueKey,
+			toState:     "To Do",
+			expectedMsg: "",
+			expectedErr: errors.New(noPermissionsError),
+		},
+		"Looking for an invalid state": {
+			issueKey:    existingIssueKey,
+			toState:     "tofu",
+			expectedMsg: "",
+			expectedErr: errors.New("\"tofu\" is not a valid state. Please use one of: \"To Do, In Progress, In Testing\""),
+		},
+		"Matching multiple available states": {
+			issueKey:    existingIssueKey,
+			toState:     "in",
+			expectedMsg: "",
+			expectedErr: errors.New("please be more specific, \"in\" matched several states: \"In Progress, In Testing\""),
+		},
+		"Successfully transitioning to new state": {
+			issueKey:    existingIssueKey,
+			toState:     "inprog",
+			expectedMsg: fmt.Sprintf("[%s](%s/browse/%s) transitioned to `In Progress`", existingIssueKey, mockInstance1URL, existingIssueKey),
+			expectedErr: nil,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			actual, err := p.TransitionIssue(&InTransitionIssue{
+				InstanceID:       testInstance1.InstanceID,
+				mattermostUserID: "connected_user",
+				IssueKey:         tt.issueKey,
+				ToState:          tt.toState,
+			})
+			assert.Equal(t, tt.expectedMsg, actual)
+			if tt.expectedErr != nil {
+				assert.Error(t, tt.expectedErr, err)
+			}
+		})
+	}
+}
+
+func TestRouteIssueTransition(t *testing.T) {
+	const (
+		headerUserID       = "user-id"
+		botUserID          = "jira-bot"
+		validPostID        = "valid-post"
+		wrongAuthorPostID  = "wrong-author-post"
+		missingPostID      = "missing-post"
+		wrongChannelPostID = "wrong-channel-post"
+	)
+
+	api := &plugintest.API{}
+	api.On("SendEphemeralPost", mock.AnythingOfType("string"), mock.AnythingOfType("*model.Post")).Return(&model.Post{})
+	api.On("LogWarn", "ERROR: ", "Status", "401", "Error", "", "Path", "/api/v2/transition", "Method", "POST", "query", "").Return(nil).Maybe()
+	api.On("LogWarn", "ERROR: ", "Status", "400", "Error", "", "Path", "/api/v2/transition", "Method", "POST", "query", "").Return(nil).Maybe()
+	api.On("LogWarn", "ERROR: ", "Status", "404", "Error", "", "Path", "/api/v2/transition", "Method", "POST", "query", "").Return(nil).Maybe()
+	api.On("LogWarn", "ERROR: ", "Status", "500", "Error", "", "Path", "/api/v2/transition", "Method", "POST", "query", "").Return(nil).Maybe()
+	api.On("LogWarn", "Recovered from a panic", "url", "/api/v2/transition", "error", mock.Anything, "stack", mock.Anything).Return(nil).Maybe()
+	api.On("LogWarn", "transition payload user mismatch", "header_user_id", headerUserID, "payload_user_id", "different-user").Return().Maybe()
+	api.On("GetPost", validPostID).Return(&model.Post{Id: validPostID, UserId: botUserID, ChannelId: "channel-id"}, nil)
+	api.On("GetPost", wrongAuthorPostID).Return(&model.Post{Id: wrongAuthorPostID, UserId: "not-bot"}, nil)
+	api.On("GetPost", missingPostID).Return(nil, (*model.AppError)(nil))
+	api.On("GetPost", wrongChannelPostID).Return(&model.Post{Id: wrongChannelPostID, UserId: botUserID, ChannelId: "different-channel"}, nil)
+	api.On("DeleteEphemeralPost", mock.AnythingOfType("string"), mock.AnythingOfType("string")).Return(nil).Maybe()
+
+	p := setupTestPlugin(api)
+	p.updateConfig(func(conf *config) {
+		conf.botUserID = botUserID
+	})
+
+	cases := map[string]struct {
+		header        string
+		request       *model.PostActionIntegrationRequest
+		expectedCode  int
+		skipSignature bool
+	}{
+		"Missing header": {
+			header:       "",
+			request:      nil,
+			expectedCode: http.StatusUnauthorized,
+		},
+		"Missing post id": {
+			header: headerUserID,
+			request: &model.PostActionIntegrationRequest{
+				UserId:    headerUserID,
+				ChannelId: "channel-id",
+				PostId:    "",
+			},
+			expectedCode: http.StatusBadRequest,
+		},
+		"Post not found": {
+			header: headerUserID,
+			request: &model.PostActionIntegrationRequest{
+				UserId:    headerUserID,
+				ChannelId: "channel-id",
+				PostId:    missingPostID,
+				Context: map[string]interface{}{
+					"issue_key":       "TEST-10",
+					"selected_option": "31",
+					"instance_id":     testInstance1.InstanceID.String(),
+				},
+			},
+			expectedCode: http.StatusOK,
+		},
+		"Post not found without signature": {
+			header: headerUserID,
+			request: &model.PostActionIntegrationRequest{
+				UserId:    headerUserID,
+				ChannelId: "channel-id",
+				PostId:    missingPostID,
+				Context: map[string]interface{}{
+					"issue_key":       "TEST-10",
+					"selected_option": "31",
+					"instance_id":     testInstance1.InstanceID.String(),
+				},
+			},
+			expectedCode:  http.StatusNotFound,
+			skipSignature: true,
+		},
+		"Post not from Jira bot": {
+			header: headerUserID,
+			request: &model.PostActionIntegrationRequest{
+				UserId:    headerUserID,
+				ChannelId: "channel-id",
+				PostId:    wrongAuthorPostID,
+				Context: map[string]interface{}{
+					"issue_key":       "TEST-10",
+					"selected_option": "31",
+					"instance_id":     testInstance1.InstanceID.String(),
+				},
+			},
+			expectedCode: http.StatusUnauthorized,
+		},
+		"Channel mismatch": {
+			header: headerUserID,
+			request: &model.PostActionIntegrationRequest{
+				UserId:    headerUserID,
+				ChannelId: "channel-id",
+				PostId:    wrongChannelPostID,
+				Context: map[string]interface{}{
+					"issue_key":       "TEST-10",
+					"selected_option": "31",
+					"instance_id":     testInstance1.InstanceID.String(),
+				},
+			},
+			expectedCode: http.StatusBadRequest,
+		},
+		"Invalid issue key": {
+			header: headerUserID,
+			request: &model.PostActionIntegrationRequest{
+				UserId:    headerUserID,
+				ChannelId: "channel-id",
+				PostId:    validPostID,
+				Context: map[string]interface{}{
+					"issue_key":       "bad",
+					"selected_option": "31",
+					"instance_id":     testInstance1.InstanceID.String(),
+				},
+			},
+			expectedCode: http.StatusBadRequest,
+		},
+		"Missing transition option": {
+			header: headerUserID,
+			request: &model.PostActionIntegrationRequest{
+				UserId:    headerUserID,
+				ChannelId: "channel-id",
+				PostId:    validPostID,
+				Context: map[string]interface{}{
+					"issue_key":   "TEST-10",
+					"instance_id": testInstance1.InstanceID.String(),
+				},
+			},
+			expectedCode: http.StatusInternalServerError,
+		},
+		"Missing instance id": {
+			header: headerUserID,
+			request: &model.PostActionIntegrationRequest{
+				UserId:    headerUserID,
+				ChannelId: "channel-id",
+				PostId:    validPostID,
+				Context: map[string]interface{}{
+					"issue_key":       "TEST-10",
+					"selected_option": "31",
+				},
+			},
+			expectedCode: http.StatusInternalServerError,
+		},
+		"Payload mismatch allowed": {
+			header: headerUserID,
+			request: &model.PostActionIntegrationRequest{
+				UserId:    "different-user",
+				ChannelId: "channel-id",
+				PostId:    validPostID,
+				Context: map[string]interface{}{
+					"issue_key":       "TEST-10",
+					"selected_option": "31",
+					"instance_id":     testInstance1.InstanceID.String(),
+				},
+			},
+			expectedCode: http.StatusOK,
+		},
+		"Happy Path": {
+			header: headerUserID,
+			request: &model.PostActionIntegrationRequest{
+				UserId:    headerUserID,
+				ChannelId: "channel-id",
+				PostId:    validPostID,
+				Context: map[string]interface{}{
+					"issue_key":       "TEST-10",
+					"selected_option": "31",
+					"instance_id":     testInstance1.InstanceID.String(),
+				},
+			},
+			expectedCode: http.StatusInternalServerError,
+		},
+	}
+
+	for name, tt := range cases {
+		t.Run(name, func(t *testing.T) {
+			body := ""
+			if tt.request != nil {
+				if !tt.skipSignature {
+					addActionSignatureToRequest(p, tt.request)
+				}
+				bb, err := json.Marshal(tt.request)
+				assert.Nil(t, err)
+				body = string(bb)
+			}
+
+			req := httptest.NewRequest("POST", makeAPIRoute(routeIssueTransition), strings.NewReader(body))
+			if tt.header != "" {
+				req.Header.Set(headerMattermostUserID, tt.header)
+			}
+
+			w := httptest.NewRecorder()
+			p.ServeHTTP(&plugin.Context{}, w, req)
+			assert.Equal(t, tt.expectedCode, w.Result().StatusCode, "status code mismatch")
+		})
+	}
+}
+
+func TestRouteShareIssuePublicly(t *testing.T) {
+	const (
+		headerUserID       = "1"
+		botUserID          = "jira-bot"
+		validPostID        = "valid-post"
+		wrongAuthorPostID  = "wrong-author-post"
+		missingPostID      = "missing-post"
+		wrongChannelPostID = "wrong-channel-post"
+	)
+
+	api := &plugintest.API{}
+	api.On("SendEphemeralPost", mock.AnythingOfType("string"), mock.AnythingOfType("*model.Post")).Return(&model.Post{})
+	api.On("CreatePost", mock.AnythingOfType("*model.Post")).Return(&model.Post{}, nil)
+	api.On("DeleteEphemeralPost", mock.AnythingOfType("string"), mock.AnythingOfType("string")).Return(nil).Maybe()
+	api.On("GetPost", validPostID).Return(&model.Post{Id: validPostID, UserId: botUserID, ChannelId: "channel-id"}, nil)
+	api.On("GetPost", wrongAuthorPostID).Return(&model.Post{Id: wrongAuthorPostID, UserId: "someone-else", ChannelId: "channel-id"}, nil)
+	api.On("GetPost", missingPostID).Return(nil, (*model.AppError)(nil))
+	api.On("GetPost", wrongChannelPostID).Return(&model.Post{Id: wrongChannelPostID, UserId: botUserID, ChannelId: "different-channel"}, nil)
+	api.On("LogWarn", "share issue payload user mismatch", "header_user_id", headerUserID, "payload_user_id", "someone-else").Return().Maybe()
+	api.On("LogWarn", "ERROR: ", "Status", "400", "Error", "", "Path", "/api/v2/share-issue-publicly", "Method", "POST", "query", "").Return(nil).Maybe()
+	api.On("LogWarn", "ERROR: ", "Status", "404", "Error", "", "Path", "/api/v2/share-issue-publicly", "Method", "POST", "query", "").Return(nil).Maybe()
+	api.On("LogWarn", "ERROR: ", "Status", "500", "Error", "", "Path", "/api/v2/share-issue-publicly", "Method", "POST", "query", "").Return(nil).Maybe()
+	api.On("LogWarn", "Recovered from a panic", "url", "/api/v2/share-issue-publicly", "error", mock.Anything, "stack", mock.Anything).Return(nil).Maybe()
+
+	p := setupTestPlugin(api)
+	p.updateConfig(func(conf *config) {
+		conf.botUserID = botUserID
+	})
+
+	cases := map[string]struct {
+		header        string
+		request       *model.PostActionIntegrationRequest
+		expectedCode  int
+		skipSignature bool
+	}{
+		"Missing header": {
+			header:       "",
+			request:      nil,
+			expectedCode: http.StatusUnauthorized,
+		},
+		"Missing post id": {
+			header: headerUserID,
+			request: &model.PostActionIntegrationRequest{
+				UserId:    headerUserID,
+				ChannelId: "channel-id",
+				PostId:    "",
+			},
+			expectedCode: http.StatusBadRequest,
+		},
+		"Post not found": {
+			header: headerUserID,
+			request: &model.PostActionIntegrationRequest{
+				UserId:    headerUserID,
+				ChannelId: "channel-id",
+				PostId:    missingPostID,
+				Context: map[string]interface{}{
+					"issue_key":   "TEST-10",
+					"instance_id": testInstance1.InstanceID.String(),
+				},
+			},
+			expectedCode: http.StatusOK,
+		},
+		"Post not found without signature": {
+			header: headerUserID,
+			request: &model.PostActionIntegrationRequest{
+				UserId:    headerUserID,
+				ChannelId: "channel-id",
+				PostId:    missingPostID,
+				Context: map[string]interface{}{
+					"issue_key":   "TEST-10",
+					"instance_id": testInstance1.InstanceID.String(),
+				},
+			},
+			expectedCode:  http.StatusNotFound,
+			skipSignature: true,
+		},
+		"Post not from Jira bot": {
+			header: headerUserID,
+			request: &model.PostActionIntegrationRequest{
+				UserId:    headerUserID,
+				ChannelId: "channel-id",
+				PostId:    wrongAuthorPostID,
+				Context: map[string]interface{}{
+					"issue_key":   "TEST-10",
+					"instance_id": testInstance1.InstanceID.String(),
+				},
+			},
+			expectedCode: http.StatusUnauthorized,
+		},
+		"Channel mismatch": {
+			header: headerUserID,
+			request: &model.PostActionIntegrationRequest{
+				UserId:    headerUserID,
+				ChannelId: "channel-id",
+				PostId:    wrongChannelPostID,
+				Context: map[string]interface{}{
+					"issue_key":   "TEST-10",
+					"instance_id": testInstance1.InstanceID.String(),
+				},
+			},
+			expectedCode: http.StatusBadRequest,
+		},
+		"Missing issue key": {
+			header: headerUserID,
+			request: &model.PostActionIntegrationRequest{
+				UserId:    headerUserID,
+				ChannelId: "channel-id",
+				PostId:    validPostID,
+				Context: map[string]interface{}{
+					"instance_id": testInstance1.InstanceID.String(),
+				},
+			},
+			expectedCode: http.StatusInternalServerError,
+		},
+		"Invalid issue key": {
+			header: headerUserID,
+			request: &model.PostActionIntegrationRequest{
+				UserId:    headerUserID,
+				ChannelId: "channel-id",
+				PostId:    validPostID,
+				Context: map[string]interface{}{
+					"issue_key":   "bad",
+					"instance_id": testInstance1.InstanceID.String(),
+				},
+			},
+			expectedCode: http.StatusBadRequest,
+		},
+		"Missing instance id": {
+			header: headerUserID,
+			request: &model.PostActionIntegrationRequest{
+				UserId:    headerUserID,
+				ChannelId: "channel-id",
+				PostId:    validPostID,
+				Context: map[string]interface{}{
+					"issue_key": "TEST-10",
+				},
+			},
+			expectedCode: http.StatusInternalServerError,
+		},
+		"No connection": {
+			header: headerUserID,
+			request: &model.PostActionIntegrationRequest{
+				UserId:    headerUserID,
+				ChannelId: "channel-id",
+				PostId:    validPostID,
+				Context: map[string]interface{}{
+					"issue_key":   "TEST-10",
+					"instance_id": "id",
+				},
+			},
+			expectedCode: http.StatusInternalServerError,
+		},
+		"Payload mismatch allowed": {
+			header: headerUserID,
+			request: &model.PostActionIntegrationRequest{
+				UserId:    "someone-else",
+				ChannelId: "channel-id",
+				PostId:    validPostID,
+				Context: map[string]interface{}{
+					"issue_key":   "TEST-10",
+					"instance_id": testInstance1.InstanceID.String(),
+				},
+			},
+			expectedCode: http.StatusOK,
+		},
+		"Happy Path": {
+			header: headerUserID,
+			request: &model.PostActionIntegrationRequest{
+				UserId:    headerUserID,
+				ChannelId: "channel-id",
+				PostId:    validPostID,
+				Context: map[string]interface{}{
+					"issue_key":   "TEST-10",
+					"instance_id": testInstance1.InstanceID.String(),
+				},
+			},
+			expectedCode: http.StatusOK,
+		},
+	}
+
+	for name, tt := range cases {
+		t.Run(name, func(t *testing.T) {
+			body := ""
+			if tt.request != nil {
+				if !tt.skipSignature {
+					addActionSignatureToRequest(p, tt.request)
+				}
+				bb, err := json.Marshal(tt.request)
+				assert.Nil(t, err)
+				body = string(bb)
+			}
+
+			req := httptest.NewRequest("POST", makeAPIRoute(routeSharePublicly), strings.NewReader(body))
+			if tt.header != "" {
+				req.Header.Set(headerMattermostUserID, tt.header)
+			}
+
+			w := httptest.NewRecorder()
+			p.ServeHTTP(&plugin.Context{}, w, req)
+			assert.Equal(t, tt.expectedCode, w.Result().StatusCode, "status code mismatch")
+		})
+	}
+}
+
+func TestShouldReceiveNotification(t *testing.T) {
+	cs := ConnectionSettings{}
+	cs.RolesForDMNotification = make(map[string]bool)
+	cs.RolesForDMNotification[assigneeRole] = true
+	cs.RolesForDMNotification[mentionRole] = true
+	cs.RolesForDMNotification[reporterRole] = false
+	cs.RolesForDMNotification[watchingRole] = false
+	cs.Notifications = true
+	for name, tt := range map[string]struct {
+		role         string
+		notification bool
+	}{
+		assigneeRole: {
+			role:         assigneeRole,
+			notification: true,
+		},
+		mentionRole: {
+			role:         mentionRole,
+			notification: true,
+		},
+		reporterRole: {
+			role:         reporterRole,
+			notification: false,
+		},
+		watchingRole: {
+			role:         watchingRole,
+			notification: false,
+		},
+		"No Role": {
+			role:         "",
+			notification: true,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			val := cs.ShouldReceiveNotification(tt.role)
+			assert.Equal(t, tt.notification, val)
+		})
+	}
+}
+
+func TestFetchConnectedUser(t *testing.T) {
+	p := setupTestPlugin(&plugintest.API{})
+
+	for name, tt := range map[string]struct {
+		instanceID  types.ID
+		client      Client
+		connection  *Connection
+		wh          webhook
+		expectedErr error
+	}{
+		"Success": {
+			instanceID: testInstance1.InstanceID,
+			client:     testClient{},
+			connection: &Connection{
+				Settings: &ConnectionSettings{
+					Notifications: true,
+					RolesForDMNotification: map[string]bool{
+						assigneeRole: true,
+						mentionRole:  true,
+						reporterRole: true,
+						watchingRole: true,
+					},
+				},
+				User: jira.User{
+					AccountID: "test-AccountID",
+				},
+			},
+			wh: webhook{
+				JiraWebhook: &JiraWebhook{
+					Issue: jira.Issue{
+						Fields: &jira.IssueFields{
+							Creator: &jira.User{},
+						},
+					},
+				},
+			},
+			expectedErr: nil,
+		},
+		"Issue Field not found": {
+			instanceID: testInstance1.InstanceID,
+			client:     nil,
+			connection: nil,
+			wh: webhook{
+				JiraWebhook: &JiraWebhook{
+					Issue: jira.Issue{},
+				},
+			},
+			expectedErr: nil,
+		},
+		"Unable to load instance": {
+			instanceID: "test-instanceID",
+			client:     nil,
+			connection: nil,
+			wh: webhook{
+				JiraWebhook: &JiraWebhook{
+					Issue: jira.Issue{
+						Fields: &jira.IssueFields{
+							Creator: &jira.User{},
+						},
+					},
+				},
+			},
+			expectedErr: fmt.Errorf("instance %q not found", "test-instanceID"),
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			client, connection, err := tt.wh.fetchConnectedUser(p, tt.instanceID)
+			assert.Equal(t, tt.connection, connection)
+			assert.Equal(t, tt.client, client)
+			if tt.expectedErr != nil {
+				assert.Error(t, tt.expectedErr, err)
+			}
+		})
+	}
+}
+
+func TestApplyReporterNotification(t *testing.T) {
+	p := setupTestPlugin(&plugintest.API{})
+
+	wh := &webhook{
+		eventTypes: map[string]bool{createdCommentEvent: true},
+		JiraWebhook: &JiraWebhook{
+			Comment: jira.Comment{
+				UpdateAuthor: jira.User{},
+			},
+			Issue: jira.Issue{
+				Key: "test-key",
+				Fields: &jira.IssueFields{
+					Type: jira.IssueType{
+						Name: "Story",
+					},
+					Summary: "",
+				},
+				Self: "test-self",
+			},
+		},
+	}
+	for name, tt := range map[string]struct {
+		instanceID         types.ID
+		reporter           *jira.User
+		totalNotifications int
+	}{
+		"Success": {
+			instanceID:         testInstance1.InstanceID,
+			reporter:           &jira.User{},
+			totalNotifications: 1,
+		},
+		"Unable to load instance": {
+			instanceID: "test-instanceID",
+			reporter:   &jira.User{},
+		},
+		"Reporter is nil": {
+			instanceID: testInstance1.InstanceID,
+			reporter:   nil,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			wh.notifications = []webhookUserNotification{}
+			p.applyReporterNotification(wh, tt.instanceID, tt.reporter)
+			assert.Equal(t, len(wh.notifications), tt.totalNotifications)
+		})
+	}
+}
+
+func TestGetUserSetting(t *testing.T) {
+	p := setupTestPlugin(&plugintest.API{})
+
+	jiraAccountID := "test-jiraAccountID"
+	jiraUsername := "test-jiraUsername"
+
+	for name, tt := range map[string]struct {
+		wh          *webhook
+		instanceID  types.ID
+		connection  *Connection
+		expectedErr error
+	}{
+		"Success": {
+			wh:         &webhook{},
+			instanceID: testInstance1.InstanceID,
+			connection: &Connection{
+				User: jira.User{AccountID: "test-AccountID"},
+				Settings: &ConnectionSettings{
+					Notifications: true,
+					RolesForDMNotification: (map[string]bool{
+						assigneeRole: true,
+						mentionRole:  true,
+						reporterRole: true,
+						watchingRole: true,
+					}),
+				},
+			},
+			expectedErr: nil,
+		},
+		"Unable to load instance": {
+			wh:          &webhook{},
+			instanceID:  "instanceID",
+			connection:  nil,
+			expectedErr: errors.New("instance " + fmt.Sprintf("\"%s\"", "instanceID") + " not found"),
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			connection, err := p.GetUserSetting(tt.wh, tt.instanceID, jiraAccountID, jiraUsername)
+			assert.Equal(t, tt.connection, connection)
+			if tt.expectedErr != nil {
+				assert.Error(t, tt.expectedErr, err)
+			}
+		})
+	}
+}
+
+func TestRouteAttachCommentToIssue(t *testing.T) {
+	type requestStruct struct {
+		PostID      string `json:"post_id"`
+		InstanceID  string `json:"instance_id"`
+		CurrentTeam string `json:"current_team"`
+		IssueKey    string `json:"issueKey"`
+	}
+
+	type testCase struct {
+		method       string
+		header       string
+		request      *requestStruct
+		expectedCode int
+		setupMocks   func(api *plugintest.API)
+	}
+
+	successfulUserPostSetup := func(api *plugintest.API) {
+		api.On("GetPost", "1").Return(&model.Post{UserId: "1", ChannelId: "test_channel"}, (*model.AppError)(nil)).Once()
+		api.On("GetUser", "1").Return(&model.User{Username: "username"}, (*model.AppError)(nil)).Once()
+		api.On("GetChannelMember", mock.AnythingOfType("string"), mock.AnythingOfType("string")).Return(&model.ChannelMember{}, nil).Once()
+		api.On("CreatePost", mock.AnythingOfType("*model.Post")).Return(&model.Post{}, (*model.AppError)(nil)).Once()
+	}
+
+	baseMocks := func(api *plugintest.API) {
+		api.On("LogWarn", mockAnythingOfTypeBatch("string", 13)...).Return(nil).Maybe()
+		api.On("LogDebug", mockAnythingOfTypeBatch("string", 11)...).Return(nil).Maybe()
+		api.On("PublishWebSocketEvent", "update_defaults", mock.AnythingOfType("map[string]interface {}"), mock.AnythingOfType("*model.WebsocketBroadcast")).Maybe()
+	}
+
+	tests := map[string]testCase{
+		"Wrong method": {
+			method:       "GET",
+			header:       "",
+			request:      &requestStruct{},
+			expectedCode: http.StatusNotFound,
+			setupMocks: func(api *plugintest.API) {
+				baseMocks(api)
+			},
+		},
+		"No header": {
+			method:       "POST",
+			header:       "",
+			request:      &requestStruct{},
+			expectedCode: http.StatusUnauthorized,
+			setupMocks: func(api *plugintest.API) {
+				baseMocks(api)
+			},
+		},
+		"User not found": {
+			method:       "POST",
+			header:       "nobody",
+			request:      &requestStruct{},
+			expectedCode: http.StatusInternalServerError,
+			setupMocks: func(api *plugintest.API) {
+				baseMocks(api)
+			},
+		},
+		"Failed to load post": {
+			method: "POST",
+			header: "1",
+			request: &requestStruct{
+				PostID: "error_post",
+			},
+			expectedCode: http.StatusInternalServerError,
+			setupMocks: func(api *plugintest.API) {
+				baseMocks(api)
+				api.On("GetPost", "error_post").Return(nil, &model.AppError{Id: "1"}).Once()
+			},
+		},
+		"Post not found": {
+			method: "POST",
+			header: "1",
+			request: &requestStruct{
+				PostID: "post_not_found",
+			},
+			expectedCode: http.StatusNotFound,
+			setupMocks: func(api *plugintest.API) {
+				baseMocks(api)
+				api.On("GetPost", "post_not_found").Return(nil, (*model.AppError)(nil)).Once()
+			},
+		},
+		"Post user not found": {
+			method: "POST",
+			header: "1",
+			request: &requestStruct{
+				PostID: "0",
+			},
+			expectedCode: http.StatusNotFound,
+			setupMocks: func(api *plugintest.API) {
+				baseMocks(api)
+				api.On("GetPost", "0").Return(&model.Post{UserId: "0", ChannelId: "test_channel"}, (*model.AppError)(nil)).Once()
+				api.On("GetChannelMember", mock.AnythingOfType("string"), mock.AnythingOfType("string")).Return(&model.ChannelMember{}, nil).Once()
+				api.On("GetUser", "0").Return(nil, &model.AppError{Id: "1"}).Once()
+			},
+		},
+		"User does not have channel access": {
+			method: "POST",
+			header: "1",
+			request: &requestStruct{
+				PostID:   "1",
+				IssueKey: existingIssueKey,
+			},
+			expectedCode: http.StatusForbidden,
+			setupMocks: func(api *plugintest.API) {
+				baseMocks(api)
+				api.On("GetPost", "1").Return(&model.Post{UserId: "1", ChannelId: "test_channel"}, (*model.AppError)(nil)).Once()
+				api.On("GetChannelMember", "test_channel", mock.AnythingOfType("string")).Return(nil, &model.AppError{Id: "channel_access_denied"}).Once()
+			},
+		},
+		"No permissions to comment on issue": {
+			method: "POST",
+			header: "1",
+			request: &requestStruct{
+				PostID:   "1",
+				IssueKey: noPermissionsIssueKey,
+			},
+			expectedCode: http.StatusForbidden,
+			setupMocks: func(api *plugintest.API) {
+				baseMocks(api)
+				api.On("GetPost", "1").Return(&model.Post{UserId: "1", ChannelId: "test_channel"}, (*model.AppError)(nil)).Once()
+				api.On("GetUser", "1").Return(&model.User{Username: "username"}, (*model.AppError)(nil)).Once()
+				api.On("GetChannelMember", mock.AnythingOfType("string"), mock.AnythingOfType("string")).Return(&model.ChannelMember{}, nil).Once()
+			},
+		},
+		"Failed to attach the comment": {
+			method: "POST",
+			header: "1",
+			request: &requestStruct{
+				PostID:   "1",
+				IssueKey: attachCommentErrorKey,
+			},
+			expectedCode: http.StatusInternalServerError,
+			setupMocks: func(api *plugintest.API) {
+				baseMocks(api)
+				api.On("GetPost", "1").Return(&model.Post{UserId: "1", ChannelId: "test_channel"}, (*model.AppError)(nil)).Once()
+				api.On("GetUser", "1").Return(&model.User{Username: "username"}, (*model.AppError)(nil)).Once()
+				api.On("GetChannelMember", mock.AnythingOfType("string"), mock.AnythingOfType("string")).Return(&model.ChannelMember{}, nil).Once()
+			},
+		},
+		"Successfully created notification post": {
+			method: "POST",
+			header: "1",
+			request: &requestStruct{
+				PostID:   "1",
+				IssueKey: existingIssueKey,
+			},
+			expectedCode: http.StatusOK,
+			setupMocks: func(api *plugintest.API) {
+				baseMocks(api)
+				successfulUserPostSetup(api)
+			},
+		},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := &plugintest.API{}
+
+			tt.setupMocks(api)
+
+			p := Plugin{}
+			p.SetAPI(api)
+			p.initializeRouter()
+			p.instanceStore = p.getMockInstanceStoreKV(1)
+			p.userStore = getMockUserStoreKV()
+			p.client = pluginapi.NewClient(api, p.Driver)
+			p.updateConfig(func(conf *config) {
+				conf.mattermostSiteURL = "https://somelink.com"
+			})
+
+			tt.request.InstanceID = testInstance1.InstanceID.String()
+			bb, err := json.Marshal(tt.request)
+			assert.Nil(t, err, name)
+
+			request := httptest.NewRequest(tt.method, makeAPIRoute(routeAPIAttachCommentToIssue), strings.NewReader(string(bb)))
+			request.Header.Add("Mattermost-User-Id", tt.header)
+			w := httptest.NewRecorder()
+			p.ServeHTTP(&plugin.Context{}, w, request)
+			assert.Equal(t, tt.expectedCode, w.Result().StatusCode, name)
+			api.AssertExpectations(t)
+		})
+	}
+}
+func setupCreateIssueAPIMock() *plugintest.API {
+	api := &plugintest.API{}
+
+	api.On("GetPost", "accessible_post_id").Return(&model.Post{
+		Id:        "accessible_post_id",
+		UserId:    "connected_user",
+		ChannelId: "channel_id_1",
+		Message:   "Test message",
+	}, (*model.AppError)(nil))
+
+	api.On("GetPost", "inaccessible_post_id").Return(&model.Post{
+		Id:        "inaccessible_post_id",
+		UserId:    "other_user",
+		ChannelId: "private_channel_id",
+		Message:   "Private message",
+	}, (*model.AppError)(nil))
+
+	api.On("GetPost", "accessible_reply_post_id").Return(&model.Post{
+		Id:        "accessible_reply_post_id",
+		UserId:    "connected_user",
+		ChannelId: "channel_id_1",
+		RootId:    "root_post_id",
+		Message:   "Reply message",
+	}, (*model.AppError)(nil))
+
+	api.On("GetPost", "inaccessible_reply_post_id").Return(&model.Post{
+		Id:        "inaccessible_reply_post_id",
+		UserId:    "other_user",
+		ChannelId: "private_channel_id",
+		RootId:    "private_root_post_id",
+		Message:   "Private reply",
+	}, (*model.AppError)(nil))
+
+	api.On("GetPost", "nonexistent_post_id").Return(nil, &model.AppError{
+		Id:      "app.post.get.app_error",
+		Message: "Post not found",
+	})
+
+	api.On("GetPost", "dm_post_id").Return(&model.Post{
+		Id:        "dm_post_id",
+		UserId:    "other_user",
+		ChannelId: "dm_channel_id",
+		Message:   "DM message",
+	}, (*model.AppError)(nil))
+
+	api.On("GetChannelMember", "channel_id_1", "connected_user").Return(&model.ChannelMember{
+		ChannelId: "channel_id_1",
+		UserId:    "connected_user",
+	}, (*model.AppError)(nil))
+
+	api.On("GetChannelMember", "private_channel_id", "connected_user").Return(nil, &model.AppError{
+		Id:      "api.context.permissions.app_error",
+		Message: "User does not have access to this channel",
+	})
+
+	api.On("GetChannelMember", "dm_channel_id", "connected_user").Return(nil, &model.AppError{
+		Id:      "api.context.permissions.app_error",
+		Message: "User does not have access to this channel",
+	})
+
+	api.On("SendEphemeralPost", mock.AnythingOfType("string"), mock.AnythingOfType("*model.Post")).Return(&model.Post{})
+	api.On("CreatePost", mock.AnythingOfType("*model.Post")).Return(&model.Post{}, (*model.AppError)(nil))
+	api.On("PublishWebSocketEvent", "update_defaults", mock.AnythingOfType("map[string]interface {}"), mock.AnythingOfType("*model.WebsocketBroadcast"))
+	api.On("KVGet", mock.AnythingOfType("string")).Return(nil, (*model.AppError)(nil))
+
+	return api
+}
+
+func TestCreateIssue(t *testing.T) {
+	tests := map[string]struct {
+		postID         string
+		channelID      string
+		expectedStatus int
+		expectError    bool
+		errorContains  string
+	}{
+		"Create issue without post - should succeed": {
+			postID:         "",
+			channelID:      "channel_id_1",
+			expectedStatus: http.StatusOK,
+			expectError:    false,
+		},
+		"Create issue with accessible post - should succeed": {
+			postID:         "accessible_post_id",
+			channelID:      "channel_id_1",
+			expectedStatus: http.StatusOK,
+			expectError:    false,
+		},
+		"Create issue with inaccessible post - should fail with 403": {
+			postID:         "inaccessible_post_id",
+			channelID:      "channel_id_1",
+			expectedStatus: http.StatusForbidden,
+			expectError:    true,
+			errorContains:  "User does not have access to this channel",
+		},
+		"SECURITY: Bypass attempt - inaccessible post with accessible channelID in request should fail": {
+			postID:         "inaccessible_post_id", // post is in private_channel_id
+			channelID:      "channel_id_1",         // attacker provides accessible channel ID
+			expectedStatus: http.StatusForbidden,
+			expectError:    true,
+			errorContains:  "User does not have access to this channel",
+		},
+		"Create issue with accessible reply post - should succeed": {
+			postID:         "accessible_reply_post_id",
+			channelID:      "channel_id_1",
+			expectedStatus: http.StatusOK,
+			expectError:    false,
+		},
+		"Create issue with inaccessible reply post - should fail with 403": {
+			postID:         "inaccessible_reply_post_id",
+			channelID:      "channel_id_1",
+			expectedStatus: http.StatusForbidden,
+			expectError:    true,
+			errorContains:  "User does not have access to this channel",
+		},
+		"Create issue with nonexistent post - should fail with 500": {
+			postID:         "nonexistent_post_id",
+			channelID:      "channel_id_1",
+			expectedStatus: http.StatusInternalServerError,
+			expectError:    true,
+			errorContains:  "failed to load post",
+		},
+		"Create issue with DM post user doesn't have access to - should fail with 403": {
+			postID:         "dm_post_id",
+			channelID:      "channel_id_1",
+			expectedStatus: http.StatusForbidden,
+			expectError:    true,
+			errorContains:  "User does not have access to this channel",
+		},
+		"SECURITY (MM-69541): post_id omitted with private channel_id should fail with 403": {
+			postID:         "",
+			channelID:      "private_channel_id",
+			expectedStatus: http.StatusForbidden,
+			expectError:    true,
+			errorContains:  "User does not have access to this channel",
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := setupCreateIssueAPIMock()
+
+			p := Plugin{}
+			p.initializeRouter()
+			p.SetAPI(api)
+			p.client = pluginapi.NewClient(api, p.Driver)
+			p.updateConfig(func(conf *config) {
+				conf.mattermostSiteURL = "https://somelink.com"
+			})
+			p.userStore = getMockUserStoreKV()
+			p.instanceStore = p.getMockInstanceStoreKV(1)
+
+			in := &InCreateIssue{
+				PostID:           tt.postID,
+				CurrentTeam:      "test_team",
+				ChannelID:        tt.channelID,
+				mattermostUserID: "connected_user",
+				InstanceID:       testInstance1.InstanceID,
+				Fields: jira.IssueFields{
+					Project: jira.Project{
+						Key: mockProjectKey,
+					},
+					Type: jira.IssueType{
+						ID: "10001",
+					},
+					Summary:     "Test Issue",
+					Description: "Test description",
+				},
+			}
+
+			issue, statusCode, err := p.CreateIssue(in)
+
+			assert.Equal(t, tt.expectedStatus, statusCode, "Expected status code to match")
+
+			if tt.expectError {
+				assert.Error(t, err, "Expected an error")
+				if tt.errorContains != "" {
+					assert.Contains(t, err.Error(), tt.errorContains, "Error should contain expected text")
+				}
+				assert.Nil(t, issue, "Issue should be nil when error occurs")
+
+				// Forbidden / failed paths must never write a post via the
+				// elevated plugin API; this guards against MM-69541-style
+				// regressions where authorization runs after the post is
+				// already created.
+				if tt.expectedStatus == http.StatusForbidden {
+					api.AssertNotCalled(t, "CreatePost", mock.Anything)
+					api.AssertNotCalled(t, "SendEphemeralPost", mock.Anything, mock.Anything)
+				}
+			} else {
+				assert.NoError(t, err, "Expected no error")
+				assert.NotNil(t, issue, "Issue should not be nil on success")
+			}
+		})
+	}
+}
+
+func setupRouteCreateIssueAPIMock() *plugintest.API {
+	api := setupCreateIssueAPIMock()
+	api.On("LogWarn", mockAnythingOfTypeBatch("string", 13)...).Return(nil)
+	api.On("LogDebug", mockAnythingOfTypeBatch("string", 11)...).Return(nil)
+	return api
+}
+
+func TestRouteCreateIssue(t *testing.T) {
+	type requestStruct struct {
+		PostID      string           `json:"post_id"`
+		InstanceID  string           `json:"instance_id"`
+		CurrentTeam string           `json:"current_team"`
+		ChannelID   string           `json:"channel_id"`
+		Fields      jira.IssueFields `json:"fields"`
+	}
+
+	tests := map[string]struct {
+		method       string
+		userID       string
+		request      *requestStruct
+		expectedCode int
+	}{
+		"No user header": {
+			method:       "POST",
+			userID:       "",
+			request:      &requestStruct{},
+			expectedCode: http.StatusUnauthorized,
+		},
+		"Create issue without post - should succeed": {
+			method: "POST",
+			userID: "connected_user",
+			request: &requestStruct{
+				PostID:      "",
+				CurrentTeam: "test_team",
+				ChannelID:   "channel_id_1",
+				Fields: jira.IssueFields{
+					Project: jira.Project{
+						Key: mockProjectKey,
+					},
+					Type: jira.IssueType{
+						ID: "10001",
+					},
+					Summary:     "Test Issue",
+					Description: "Test description",
+				},
+			},
+			expectedCode: http.StatusOK,
+		},
+		"Create issue with accessible post - should succeed": {
+			method: "POST",
+			userID: "connected_user",
+			request: &requestStruct{
+				PostID:      "accessible_post_id",
+				CurrentTeam: "test_team",
+				ChannelID:   "channel_id_1",
+				Fields: jira.IssueFields{
+					Project: jira.Project{
+						Key: mockProjectKey,
+					},
+					Type: jira.IssueType{
+						ID: "10001",
+					},
+					Summary:     "Test Issue",
+					Description: "Test description",
+				},
+			},
+			expectedCode: http.StatusOK,
+		},
+		"Create issue with inaccessible post - should fail with 403": {
+			method: "POST",
+			userID: "connected_user",
+			request: &requestStruct{
+				PostID:      "inaccessible_post_id",
+				CurrentTeam: "test_team",
+				ChannelID:   "channel_id_1",
+				Fields: jira.IssueFields{
+					Project: jira.Project{
+						Key: mockProjectKey,
+					},
+					Type: jira.IssueType{
+						ID: "10001",
+					},
+					Summary:     "Test Issue",
+					Description: "Test description",
+				},
+			},
+			expectedCode: http.StatusForbidden,
+		},
+		"SECURITY: Bypass attempt via HTTP route - should fail with 403": {
+			method: "POST",
+			userID: "connected_user",
+			request: &requestStruct{
+				PostID:      "inaccessible_post_id", // post is in private_channel_id
+				CurrentTeam: "test_team",
+				ChannelID:   "channel_id_1", // attacker provides accessible channel ID
+				Fields: jira.IssueFields{
+					Project: jira.Project{
+						Key: mockProjectKey,
+					},
+					Type: jira.IssueType{
+						ID: "10001",
+					},
+					Summary:     "Test Issue",
+					Description: "Test description",
+				},
+			},
+			expectedCode: http.StatusForbidden,
+		},
+		"SECURITY (MM-69541): empty post_id with private channel_id should fail with 403": {
+			method: "POST",
+			userID: "connected_user",
+			request: &requestStruct{
+				PostID:      "",
+				CurrentTeam: "test_team",
+				ChannelID:   "private_channel_id",
+				Fields: jira.IssueFields{
+					Project: jira.Project{
+						Key: mockProjectKey,
+					},
+					Type: jira.IssueType{
+						ID: "10001",
+					},
+					Summary:     "Test Issue",
+					Description: "Test description",
+				},
+			},
+			expectedCode: http.StatusForbidden,
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			api := setupRouteCreateIssueAPIMock()
+
+			p := Plugin{}
+			p.initializeRouter()
+			p.SetAPI(api)
+			p.client = pluginapi.NewClient(api, p.Driver)
+			p.updateConfig(func(conf *config) {
+				conf.mattermostSiteURL = "https://somelink.com"
+			})
+			p.userStore = getMockUserStoreKV()
+			p.instanceStore = p.getMockInstanceStoreKV(1)
+
+			tt.request.InstanceID = testInstance1.InstanceID.String()
+			bb, err := json.Marshal(tt.request)
+			assert.Nil(t, err, name)
+
+			request := httptest.NewRequest(tt.method, makeAPIRoute(routeAPICreateIssue), strings.NewReader(string(bb)))
+			request.Header.Add("Mattermost-User-Id", tt.userID)
+			w := httptest.NewRecorder()
+			p.ServeHTTP(&plugin.Context{}, w, request)
+			assert.Equal(t, tt.expectedCode, w.Result().StatusCode, name)
+
+			if tt.expectedCode == http.StatusForbidden {
+				api.AssertNotCalled(t, "CreatePost", mock.Anything)
+				api.AssertNotCalled(t, "SendEphemeralPost", mock.Anything, mock.Anything)
+			}
+		})
+	}
+}
+
+func TestShouldNotifyWatcherUser(t *testing.T) {
+	author := &jira.User{AccountID: "acct-1", Name: "author"}
+	require.True(t, shouldNotifyWatcherUser(jira.Watcher{AccountID: "acct-2", Name: "other"}, author))
+	require.False(t, shouldNotifyWatcherUser(jira.Watcher{AccountID: "acct-1", Name: "author"}, author))
+
+	nameOnlyAuthor := &jira.User{Name: "name-only"}
+	require.False(t, shouldNotifyWatcherUser(jira.Watcher{Name: "name-only"}, nameOnlyAuthor))
+	require.True(t, shouldNotifyWatcherUser(jira.Watcher{Name: "different"}, nameOnlyAuthor))
+
+	require.True(t, shouldNotifyWatcherUser(jira.Watcher{Name: "someone"}, nil))
+}
+
+func TestGetWatchersWithAPIToken(t *testing.T) {
+	watchersPayload := jira.Watches{
+		WatchCount: 2,
+		IsWatching: false,
+		Watchers: []*jira.Watcher{
+			{AccountID: "acct-100", DisplayName: "Watcher One", Active: true},
+			{Name: "watcher-two", DisplayName: "Watcher Two", Active: true},
+		},
+	}
+
+	newCloudInst := func(baseURL string) Instance {
+		return &testInstance{InstanceCommon: InstanceCommon{
+			InstanceID: types.ID(baseURL),
+			Type:       CloudInstanceType,
+		}}
+	}
+	newCloudOAuthInst := func(baseURL string) Instance {
+		return &testInstance{InstanceCommon: InstanceCommon{
+			InstanceID: types.ID(baseURL),
+			Type:       CloudOAuthInstanceType,
+		}}
+	}
+	newServerInst := func(baseURL string) Instance {
+		return &testInstance{InstanceCommon: InstanceCommon{
+			InstanceID: types.ID(baseURL),
+			Type:       ServerInstanceType,
+		}}
+	}
+
+	// --- Cloud (regression): must keep using HTTP Basic auth with email:token ---
+
+	t.Run("success - Cloud uses /rest/api/3, accountId watchers, and Basic auth", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, "/rest/api/3/issue/PROJ-123/watchers", r.URL.Path)
+			assert.Equal(t, "Basic "+base64.StdEncoding.EncodeToString([]byte("admin@example.com:test-api-token")), r.Header.Get("Authorization"))
+			assert.Contains(t, r.Header.Get("User-Agent"), "Mattermost-Plugin-Jira/")
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(watchersPayload) //nolint:errcheck
+		}))
+		defer ts.Close()
+
+		p := setupTestPlugin(&plugintest.API{})
+		tokenJSON, _ := json.Marshal("test-api-token")
+		p.updateConfig(func(conf *config) {
+			conf.AdminAPIToken = string(tokenJSON)
+			conf.AdminEmail = "admin@example.com"
+			conf.EncryptionKey = ""
+		})
+
+		watchers, err := p.GetWatchersWithAPIToken("PROJ-123", newCloudInst(ts.URL))
+		require.NoError(t, err)
+		require.NotNil(t, watchers)
+		assert.Equal(t, 2, watchers.WatchCount)
+		require.Len(t, watchers.Watchers, 2)
+		assert.Equal(t, "acct-100", watchers.Watchers[0].AccountID)
+		assert.Equal(t, "watcher-two", watchers.Watchers[1].Name)
+	})
+
+	t.Run("success - CloudOAuth also uses Basic auth", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.True(t, strings.HasPrefix(r.Header.Get("Authorization"), "Basic "))
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(watchersPayload) //nolint:errcheck
+		}))
+		defer ts.Close()
+
+		p := setupTestPlugin(&plugintest.API{})
+		tokenJSON, _ := json.Marshal("test-api-token")
+		p.updateConfig(func(conf *config) {
+			conf.AdminAPIToken = string(tokenJSON)
+			conf.AdminEmail = "admin@example.com"
+			conf.EncryptionKey = ""
+		})
+
+		watchers, err := p.GetWatchersWithAPIToken("PROJ-123", newCloudOAuthInst(ts.URL))
+		require.NoError(t, err)
+		require.NotNil(t, watchers)
+	})
+
+	t.Run("404 - issue not found", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+		}))
+		defer ts.Close()
+
+		p := setupTestPlugin(&plugintest.API{})
+		tokenJSON, _ := json.Marshal("test-api-token")
+		p.updateConfig(func(conf *config) {
+			conf.AdminAPIToken = string(tokenJSON)
+			conf.AdminEmail = "admin@example.com"
+			conf.EncryptionKey = ""
+		})
+
+		watchers, err := p.GetWatchersWithAPIToken("FAKE-999", newCloudInst(ts.URL))
+		assert.Error(t, err)
+		assert.Nil(t, watchers)
+		assert.Contains(t, err.Error(), "does not exist")
+	})
+
+	t.Run("403 - forbidden on Cloud logs the Seraph login reason", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("X-Seraph-LoginReason", "AUTHENTICATED_FAILED")
+			w.WriteHeader(http.StatusForbidden)
+		}))
+		defer ts.Close()
+
+		api := &plugintest.API{}
+		api.On("LogDebug", "Admin API token request for watchers was rejected",
+			"statusCode", http.StatusForbidden,
+			"seraphLoginReason", "AUTHENTICATED_FAILED",
+			"isCloud", true,
+			"issue", "PROJ-123").Return().Once()
+		p := setupTestPlugin(api)
+		tokenJSON, _ := json.Marshal("test-api-token")
+		p.updateConfig(func(conf *config) {
+			conf.AdminAPIToken = string(tokenJSON)
+			conf.AdminEmail = "admin@example.com"
+			conf.EncryptionKey = ""
+		})
+
+		watchers, err := p.GetWatchersWithAPIToken("PROJ-123", newCloudInst(ts.URL))
+		assert.Error(t, err)
+		assert.Nil(t, watchers)
+		assert.Contains(t, err.Error(), "permission")
+		api.AssertCalled(t, "LogDebug", "Admin API token request for watchers was rejected",
+			"statusCode", http.StatusForbidden, "seraphLoginReason", "AUTHENTICATED_FAILED", "isCloud", true, "issue", "PROJ-123")
+	})
+
+	t.Run("missing admin email returns config error", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+			t.Fatal("HTTP request should not have been made when admin email is missing")
+		}))
+		defer ts.Close()
+
+		p := setupTestPlugin(&plugintest.API{})
+		tokenJSON, _ := json.Marshal("test-api-token")
+		p.updateConfig(func(conf *config) {
+			conf.AdminAPIToken = string(tokenJSON)
+			conf.AdminEmail = ""
+			conf.EncryptionKey = ""
+		})
+
+		watchers, err := p.GetWatchersWithAPIToken("PROJ-123", newCloudInst(ts.URL))
+		require.Error(t, err)
+		assert.Nil(t, watchers)
+		assert.Contains(t, err.Error(), "admin email is empty in plugin config (required for Jira Cloud)")
+	})
+
+	// --- Server/Data Center: PAT must be sent as a Bearer token, never Basic ---
+
+	t.Run("success - Server/DC uses /rest/api/2, name-based watchers, and Bearer auth", func(t *testing.T) {
+		dcPayload := jira.Watches{
+			WatchCount: 1,
+			Watchers: []*jira.Watcher{
+				{Name: "fred", DisplayName: "Fred F. User", Active: true},
+			},
+		}
+
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, "/rest/api/2/issue/ISSUE-456/watchers", r.URL.Path)
+			assert.Equal(t, "Bearer admin-pat", r.Header.Get("Authorization"))
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(dcPayload) //nolint:errcheck
+		}))
+		defer ts.Close()
+
+		p := setupTestPlugin(&plugintest.API{})
+		tokenJSON, _ := json.Marshal("admin-pat")
+		p.updateConfig(func(conf *config) {
+			conf.AdminAPIToken = string(tokenJSON)
+			conf.AdminEmail = "admin"
+			conf.EncryptionKey = ""
+		})
+
+		watchers, err := p.GetWatchersWithAPIToken("ISSUE-456", newServerInst(ts.URL))
+		require.NoError(t, err)
+		require.NotNil(t, watchers)
+		assert.Equal(t, 1, watchers.WatchCount)
+		assert.Equal(t, "fred", watchers.Watchers[0].Name)
+	})
+
+	t.Run("success - Server/DC works without an admin email configured", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, "Bearer admin-pat", r.Header.Get("Authorization"))
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(watchersPayload) //nolint:errcheck
+		}))
+		defer ts.Close()
+
+		p := setupTestPlugin(&plugintest.API{})
+		tokenJSON, _ := json.Marshal("admin-pat")
+		p.updateConfig(func(conf *config) {
+			conf.AdminAPIToken = string(tokenJSON)
+			conf.AdminEmail = ""
+			conf.EncryptionKey = ""
+		})
+
+		watchers, err := p.GetWatchersWithAPIToken("PROJ-123", newServerInst(ts.URL))
+		require.NoError(t, err)
+		require.NotNil(t, watchers)
+	})
+
+	t.Run("Server/DC missing admin token returns config error", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+			t.Fatal("HTTP request should not have been made when admin token is missing")
+		}))
+		defer ts.Close()
+
+		p := setupTestPlugin(&plugintest.API{})
+		p.updateConfig(func(conf *config) {
+			conf.AdminAPIToken = ""
+			conf.AdminEmail = ""
+			conf.EncryptionKey = ""
+		})
+
+		watchers, err := p.GetWatchersWithAPIToken("PROJ-123", newServerInst(ts.URL))
+		require.Error(t, err)
+		assert.Nil(t, watchers)
+		assert.Contains(t, err.Error(), "admin API token is empty in plugin config")
+	})
+
+	t.Run("404 - Server/DC issue not found", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+		}))
+		defer ts.Close()
+
+		p := setupTestPlugin(&plugintest.API{})
+		tokenJSON, _ := json.Marshal("admin-pat")
+		p.updateConfig(func(conf *config) {
+			conf.AdminAPIToken = string(tokenJSON)
+			conf.EncryptionKey = ""
+		})
+
+		watchers, err := p.GetWatchersWithAPIToken("FAKE-999", newServerInst(ts.URL))
+		assert.Error(t, err)
+		assert.Nil(t, watchers)
+		assert.Contains(t, err.Error(), "does not exist")
+	})
+
+	t.Run("403 - forbidden on Server/DC logs the Seraph login reason", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("X-Seraph-LoginReason", "AUTHENTICATED_FAILED")
+			w.WriteHeader(http.StatusForbidden)
+		}))
+		defer ts.Close()
+
+		api := &plugintest.API{}
+		api.On("LogDebug", "Admin API token request for watchers was rejected",
+			"statusCode", http.StatusForbidden,
+			"seraphLoginReason", "AUTHENTICATED_FAILED",
+			"isCloud", false,
+			"issue", "ISSUE-456").Return().Once()
+		p := setupTestPlugin(api)
+		tokenJSON, _ := json.Marshal("admin-pat")
+		p.updateConfig(func(conf *config) {
+			conf.AdminAPIToken = string(tokenJSON)
+			conf.EncryptionKey = ""
+		})
+
+		watchers, err := p.GetWatchersWithAPIToken("ISSUE-456", newServerInst(ts.URL))
+		assert.Error(t, err)
+		assert.Nil(t, watchers)
+		assert.Contains(t, err.Error(), "permission")
+		api.AssertCalled(t, "LogDebug", "Admin API token request for watchers was rejected",
+			"statusCode", http.StatusForbidden, "seraphLoginReason", "AUTHENTICATED_FAILED", "isCloud", false, "issue", "ISSUE-456")
+	})
+
+	t.Run("Server/DC retries with Basic auth after a 401 when a username is set", func(t *testing.T) {
+		var authHeaders []string
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			authHeaders = append(authHeaders, r.Header.Get("Authorization"))
+			if strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(watchersPayload) //nolint:errcheck
+		}))
+		defer ts.Close()
+
+		p := setupTestPlugin(&plugintest.API{})
+		tokenJSON, _ := json.Marshal("admin-password")
+		p.updateConfig(func(conf *config) {
+			conf.AdminAPIToken = string(tokenJSON)
+			conf.AdminEmail = "admin"
+			conf.EncryptionKey = ""
+		})
+
+		watchers, err := p.GetWatchersWithAPIToken("ISSUE-456", newServerInst(ts.URL))
+		require.NoError(t, err)
+		require.NotNil(t, watchers)
+		assert.Equal(t, []string{
+			"Bearer admin-password",
+			"Basic " + base64.StdEncoding.EncodeToString([]byte("admin:admin-password")),
+		}, authHeaders)
+	})
+
+	t.Run("Server/DC stops retrying with Basic auth after the retry is also rejected", func(t *testing.T) {
+		var authHeaders []string
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			authHeaders = append(authHeaders, r.Header.Get("Authorization"))
+			w.Header().Set("X-Seraph-LoginReason", "AUTHENTICATED_FAILED")
+			w.WriteHeader(http.StatusUnauthorized)
+		}))
+		defer ts.Close()
+
+		api := &plugintest.API{}
+		api.On("LogWarn", mock.AnythingOfType("string"), "seraphLoginReason", "AUTHENTICATED_FAILED").Return()
+		api.On("LogDebug", "Admin API token request for watchers was rejected",
+			"statusCode", http.StatusUnauthorized,
+			"seraphLoginReason", "AUTHENTICATED_FAILED",
+			"isCloud", false,
+			"issue", "ISSUE-456").Return()
+		p := setupTestPlugin(api)
+		tokenJSON, _ := json.Marshal("expired-pat")
+		p.updateConfig(func(conf *config) {
+			conf.AdminAPIToken = string(tokenJSON)
+			conf.AdminEmail = "admin"
+			conf.EncryptionKey = ""
+		})
+		bearer := "Bearer expired-pat"
+		basic := "Basic " + base64.StdEncoding.EncodeToString([]byte("admin:expired-pat"))
+
+		for i := 0; i < 2; i++ {
+			_, err := p.GetWatchersWithAPIToken("ISSUE-456", newServerInst(ts.URL))
+			require.Error(t, err)
+		}
+		assert.Equal(t, []string{bearer, basic, bearer}, authHeaders)
+		api.AssertNumberOfCalls(t, "LogWarn", 1)
+
+		p.adminBasicFallbackFailed.Store(false)
+		authHeaders = nil
+		_, err := p.GetWatchersWithAPIToken("ISSUE-456", newServerInst(ts.URL))
+		require.Error(t, err)
+		assert.Equal(t, []string{bearer, basic}, authHeaders)
+	})
+
+	t.Run("Server/DC does not retry with Basic auth when no username is set", func(t *testing.T) {
+		requests := 0
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requests++
+			w.WriteHeader(http.StatusUnauthorized)
+		}))
+		defer ts.Close()
+
+		api := &plugintest.API{}
+		api.On("LogDebug", "Admin API token request for watchers was rejected",
+			"statusCode", http.StatusUnauthorized,
+			"seraphLoginReason", "",
+			"isCloud", false,
+			"issue", "ISSUE-456").Return().Once()
+		p := setupTestPlugin(api)
+		tokenJSON, _ := json.Marshal("admin-pat")
+		p.updateConfig(func(conf *config) {
+			conf.AdminAPIToken = string(tokenJSON)
+			conf.AdminEmail = ""
+			conf.EncryptionKey = ""
+		})
+
+		watchers, err := p.GetWatchersWithAPIToken("ISSUE-456", newServerInst(ts.URL))
+		require.Error(t, err)
+		assert.Nil(t, watchers)
+		assert.Equal(t, 1, requests)
+	})
+
+	t.Run("Cloud does not retry after a 401", func(t *testing.T) {
+		requests := 0
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requests++
+			w.WriteHeader(http.StatusUnauthorized)
+		}))
+		defer ts.Close()
+
+		api := &plugintest.API{}
+		api.On("LogDebug", "Admin API token request for watchers was rejected",
+			"statusCode", http.StatusUnauthorized,
+			"seraphLoginReason", "",
+			"isCloud", true,
+			"issue", "PROJ-123").Return().Once()
+		p := setupTestPlugin(api)
+		tokenJSON, _ := json.Marshal("test-api-token")
+		p.updateConfig(func(conf *config) {
+			conf.AdminAPIToken = string(tokenJSON)
+			conf.AdminEmail = "admin@example.com"
+			conf.EncryptionKey = ""
+		})
+
+		watchers, err := p.GetWatchersWithAPIToken("PROJ-123", newCloudInst(ts.URL))
+		require.Error(t, err)
+		assert.Nil(t, watchers)
+		assert.Equal(t, 1, requests)
+	})
+
+	t.Run("CloudOAuth uses the Jira base URL, not the api.atlassian.com gateway", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, "/rest/api/3/issue/PROJ-123/watchers", r.URL.Path)
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(watchersPayload) //nolint:errcheck
+		}))
+		defer ts.Close()
+
+		p := setupTestPlugin(&plugintest.API{})
+		tokenJSON, _ := json.Marshal("test-api-token")
+		p.updateConfig(func(conf *config) {
+			conf.AdminAPIToken = string(tokenJSON)
+			conf.AdminEmail = "admin@example.com"
+			conf.EncryptionKey = ""
+		})
+
+		instance := &cloudOAuthInstance{
+			InstanceCommon: &InstanceCommon{InstanceID: types.ID(ts.URL), Type: CloudOAuthInstanceType},
+			JiraBaseURL:    ts.URL,
+			JiraResourceID: "resource-id",
+		}
+		watchers, err := p.GetWatchersWithAPIToken("PROJ-123", instance)
+		require.NoError(t, err)
+		require.NotNil(t, watchers)
+	})
+}
+
+func TestGetIssueDataWithAPIToken(t *testing.T) {
+	issuePayload := jira.Issue{
+		Key: "PROJ-123",
+		Fields: &jira.IssueFields{
+			Summary: "Test Issue",
+		},
+	}
+
+	t.Run("Cloud sends Basic auth", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, "/rest/api/2/issue/PROJ-123", r.URL.Path)
+			assert.Equal(t, "Basic "+base64.StdEncoding.EncodeToString([]byte("admin@example.com:test-api-token")), r.Header.Get("Authorization"))
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(issuePayload) //nolint:errcheck
+		}))
+		defer ts.Close()
+
+		p := setupTestPlugin(&plugintest.API{})
+		tokenJSON, _ := json.Marshal("test-api-token")
+		p.updateConfig(func(conf *config) {
+			conf.AdminAPIToken = string(tokenJSON)
+			conf.AdminEmail = "admin@example.com"
+			conf.EncryptionKey = ""
+		})
+
+		instance := &testInstance{InstanceCommon: InstanceCommon{InstanceID: types.ID(ts.URL), Type: CloudInstanceType}}
+		issue, err := p.GetIssueDataWithAPIToken("PROJ-123", instance)
+		require.NoError(t, err)
+		require.NotNil(t, issue)
+		assert.Equal(t, "PROJ-123", issue.Key)
+	})
+
+	t.Run("CloudOAuth uses the Jira base URL, not the api.atlassian.com gateway", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, "/rest/api/2/issue/PROJ-123", r.URL.Path)
+			assert.True(t, strings.HasPrefix(r.Header.Get("Authorization"), "Basic "))
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(issuePayload) //nolint:errcheck
+		}))
+		defer ts.Close()
+
+		p := setupTestPlugin(&plugintest.API{})
+		tokenJSON, _ := json.Marshal("test-api-token")
+		p.updateConfig(func(conf *config) {
+			conf.AdminAPIToken = string(tokenJSON)
+			conf.AdminEmail = "admin@example.com"
+			conf.EncryptionKey = ""
+		})
+
+		instance := &cloudOAuthInstance{
+			InstanceCommon: &InstanceCommon{InstanceID: types.ID(ts.URL), Type: CloudOAuthInstanceType},
+			JiraBaseURL:    ts.URL,
+			JiraResourceID: "resource-id",
+		}
+		issue, err := p.GetIssueDataWithAPIToken("PROJ-123", instance)
+		require.NoError(t, err)
+		require.NotNil(t, issue)
+		assert.Equal(t, "PROJ-123", issue.Key)
+	})
+}
+
+func TestGetProjectListWithAPIToken(t *testing.T) {
+	projectPayload := ProjectSearchResponse{
+		Values: jira.ProjectList{{Key: "PROJ"}},
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/rest/api/3/project/search", r.URL.Path)
+		assert.Equal(t, "Basic "+base64.StdEncoding.EncodeToString([]byte("admin@example.com:test-api-token")), r.Header.Get("Authorization"))
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(projectPayload) //nolint:errcheck
+	}))
+	defer ts.Close()
+
+	p := setupTestPlugin(&plugintest.API{})
+	tokenJSON, _ := json.Marshal("test-api-token")
+	p.updateConfig(func(conf *config) {
+		conf.AdminAPIToken = string(tokenJSON)
+		conf.AdminEmail = "admin@example.com"
+		conf.EncryptionKey = ""
+	})
+
+	instance := &testInstance{InstanceCommon: InstanceCommon{InstanceID: types.ID(ts.URL), Type: CloudInstanceType}}
+	plist, err := p.GetProjectListWithAPIToken(instance)
+	require.NoError(t, err)
+	require.NotNil(t, plist)
+	require.Len(t, *plist, 1)
+	assert.Equal(t, "PROJ", (*plist)[0].Key)
+}
+
+func TestHasAdminAPIToken(t *testing.T) {
+	cloudInstance := &testInstance{InstanceCommon: InstanceCommon{Type: CloudInstanceType}}
+	cloudOAuthInstance := &testInstance{InstanceCommon: InstanceCommon{Type: CloudOAuthInstanceType}}
+	serverInstance := &testInstance{InstanceCommon: InstanceCommon{Type: ServerInstanceType}}
+
+	tests := []struct {
+		name     string
+		instance Instance
+		token    string
+		email    string
+		expected bool
+	}{
+		{name: "Cloud with token and email", instance: cloudInstance, token: "tok", email: "admin@example.com", expected: true},
+		{name: "Cloud with token but no email", instance: cloudInstance, token: "tok", email: "", expected: false},
+		{name: "Cloud with email but no token", instance: cloudInstance, token: "", email: "admin@example.com", expected: false},
+		{name: "CloudOAuth with token but no email", instance: cloudOAuthInstance, token: "tok", email: "", expected: false},
+		{name: "Server/DC with token and no email", instance: serverInstance, token: "tok", email: "", expected: true},
+		{name: "Server/DC with token and email", instance: serverInstance, token: "tok", email: "admin@example.com", expected: true},
+		{name: "Server/DC with no token", instance: serverInstance, token: "", email: "", expected: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := setupTestPlugin(&plugintest.API{})
+			p.updateConfig(func(conf *config) {
+				conf.AdminAPIToken = tt.token
+				conf.AdminEmail = tt.email
+			})
+
+			assert.Equal(t, tt.expected, p.hasAdminAPIToken(tt.instance))
+		})
+	}
+}
+
+func TestInjectTeamAllowedValues(t *testing.T) {
+	t.Run("with manual team config", func(t *testing.T) {
+		metaInfo := &jira.CreateMetaInfo{
+			Projects: []*jira.MetaProject{
+				{
+					IssueTypes: []*jira.MetaIssueType{
+						{
+							Fields: tcontainer.MarshalMap{
+								"customfield_10600": map[string]any{
+									"name": "Team",
+									"schema": map[string]any{
+										"custom": teamFieldSchema,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		teamIDList := []TeamList{
+			{Name: "Alpha Team", ID: "alpha-1"},
+			{Name: "Beta Team", ID: "beta-2"},
+		}
+
+		keys := injectTeamAllowedValues(metaInfo, teamIDList)
+		require.Len(t, keys, 1)
+		require.Contains(t, keys, "customfield_10600")
+
+		fieldMap := metaInfo.Projects[0].IssueTypes[0].Fields["customfield_10600"].(map[string]any)
+		allowedValues := fieldMap["allowedValues"].([]map[string]string)
+		require.Len(t, allowedValues, 2)
+		assert.Equal(t, "alpha-1", allowedValues[0]["id"])
+		assert.Equal(t, "Alpha Team", allowedValues[0]["name"])
+	})
+
+	t.Run("without manual config sets autoDiscovery flag", func(t *testing.T) {
+		metaInfo := &jira.CreateMetaInfo{
+			Projects: []*jira.MetaProject{
+				{
+					IssueTypes: []*jira.MetaIssueType{
+						{
+							Fields: tcontainer.MarshalMap{
+								"customfield_10600": map[string]any{
+									"name": "Team",
+									"schema": map[string]any{
+										"custom": teamFieldSchema,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		keys := injectTeamAllowedValues(metaInfo, nil)
+		require.Len(t, keys, 1)
+
+		fieldMap := metaInfo.Projects[0].IssueTypes[0].Fields["customfield_10600"].(map[string]any)
+		_, hasAllowedValues := fieldMap["allowedValues"]
+		assert.False(t, hasAllowedValues)
+	})
+
+	t.Run("detects advanced roadmaps team schema", func(t *testing.T) {
+		metaInfo := &jira.CreateMetaInfo{
+			Projects: []*jira.MetaProject{
+				{
+					IssueTypes: []*jira.MetaIssueType{
+						{
+							Fields: tcontainer.MarshalMap{
+								"customfield_10001": map[string]any{
+									"name": "Team",
+									"schema": map[string]any{
+										"custom": teamAdvancedRoadmapsSchema,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		keys := injectTeamAllowedValues(metaInfo, nil)
+		require.Len(t, keys, 1)
+		require.Contains(t, keys, "customfield_10001")
+	})
+
+	t.Run("recognizes Data Center Advanced Roadmaps team field (rm-teams)", func(t *testing.T) {
+		metaInfo := &jira.CreateMetaInfo{
+			Projects: []*jira.MetaProject{
+				{
+					IssueTypes: []*jira.MetaIssueType{
+						{
+							Fields: tcontainer.MarshalMap{
+								"customfield_10020": map[string]any{
+									"name": "Team",
+									"schema": map[string]any{
+										"custom": teamAdvancedRoadmapsDC,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		keys := injectTeamAllowedValues(metaInfo, nil)
+		require.Len(t, keys, 1)
+		require.Contains(t, keys, "customfield_10020")
+	})
+
+	t.Run("no team fields found", func(t *testing.T) {
+		metaInfo := &jira.CreateMetaInfo{
+			Projects: []*jira.MetaProject{
+				{
+					IssueTypes: []*jira.MetaIssueType{
+						{
+							Fields: tcontainer.MarshalMap{
+								"summary": map[string]any{
+									"name": "Summary",
+									"schema": map[string]any{
+										"type": "string",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		keys := injectTeamAllowedValues(metaInfo, nil)
+		require.Len(t, keys, 0)
+	})
+}
+
+func TestPreProcessTeamFields(t *testing.T) {
+	t.Run("extracts id from team field map", func(t *testing.T) {
+		fields := &jira.IssueFields{
+			Unknowns: tcontainer.MarshalMap{
+				"customfield_10001": map[string]interface{}{
+					"id": "team-123",
+				},
+			},
+		}
+		teamFieldKeys := map[string]struct{}{
+			"customfield_10001": {},
+		}
+
+		result := preProcessTeamFields(fields, teamFieldKeys)
+		assert.Equal(t, "team-123", result.Unknowns["customfield_10001"])
+	})
+
+	t.Run("ignores non-team fields", func(t *testing.T) {
+		original := map[string]interface{}{"id": "some-id"}
+		fields := &jira.IssueFields{
+			Unknowns: tcontainer.MarshalMap{
+				"customfield_99999": original,
+			},
+		}
+		teamFieldKeys := map[string]struct{}{
+			"customfield_10001": {},
+		}
+
+		result := preProcessTeamFields(fields, teamFieldKeys)
+		assert.Equal(t, original, result.Unknowns["customfield_99999"])
+	})
+
+	t.Run("nil fields returns nil", func(t *testing.T) {
+		result := preProcessTeamFields(nil, map[string]struct{}{"a": {}})
+		assert.Nil(t, result)
+	})
+
+	t.Run("empty team keys returns fields unchanged", func(t *testing.T) {
+		fields := &jira.IssueFields{}
+		result := preProcessTeamFields(fields, nil)
+		assert.Equal(t, fields, result)
+	})
+}
+
+// The webapp maps these keys verbatim, so renaming them empties the Team
+// autocomplete (MM-70879).
+func TestGetTeamFieldsWireFormat(t *testing.T) {
+	p := &Plugin{}
+	p.updateConfig(func(conf *config) {
+		conf.TeamIDList = []TeamList{{Name: "Alpha Team", ID: "alpha-1"}}
+	})
+
+	request := httptest.NewRequest(http.MethodGet, makeAPIRoute(routeAPIGetTeamFields), nil)
+	request.Header.Set(headerMattermostUserID, "connected_user")
+	recorder := httptest.NewRecorder()
+
+	_, err := p.httpGetTeamFields(recorder, request)
+	require.NoError(t, err)
+
+	var teams []map[string]any
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &teams))
+	require.Len(t, teams, 1)
+	assert.Equal(t, map[string]any{"id": "alpha-1", "name": "Alpha Team"}, teams[0])
+}
+
+// Auto-discovery builds its own TeamList values from Jira's autocomplete
+// results, so the manually configured path above cannot catch Name and ID
+// being mapped to the wrong suggestion fields.
+func TestGetTeamFieldsAutoDiscoveryWireFormat(t *testing.T) {
+	api := &plugintest.API{}
+	api.On("LogWarn", mockAnythingOfTypeBatch("string", 5)...).Maybe()
+	api.On("LogDebug", mockAnythingOfTypeBatch("string", 5)...).Maybe()
+
+	p := &Plugin{}
+	p.SetAPI(api)
+	p.client = pluginapi.NewClient(api, p.Driver)
+	p.instanceStore = p.getMockInstanceStoreKV(1)
+	p.userStore = getMockUserStoreKV()
+	p.teamFieldCache = map[types.ID]map[string]struct{}{
+		testInstance1.InstanceID: {"customfield_10800": {}},
+	}
+
+	route := fmt.Sprintf("%s?instance_id=%s&fieldValue=%s",
+		makeAPIRoute(routeAPIGetTeamFields),
+		url.QueryEscape(string(testInstance1.InstanceID)),
+		autocompleteTeamQuery)
+	request := httptest.NewRequest(http.MethodGet, route, nil)
+	request.Header.Set(headerMattermostUserID, "connected_user")
+	recorder := httptest.NewRecorder()
+
+	_, err := p.httpGetTeamFields(recorder, request)
+	require.NoError(t, err)
+
+	var teams []map[string]any
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &teams))
+	require.Len(t, teams, 1)
+	assert.Equal(t, map[string]any{"id": "discovered-1", "name": "Discovered Team"}, teams[0])
+}
+
+func TestSprintAndBoardTypes(t *testing.T) {
+	t.Run("Sprint JSON marshaling", func(t *testing.T) {
+		sprint := Sprint{ID: 1, Name: "Sprint 1", State: "active"}
+		data, err := json.Marshal(sprint)
+		require.NoError(t, err)
+
+		var decoded Sprint
+		require.NoError(t, json.Unmarshal(data, &decoded))
+		assert.Equal(t, sprint.ID, decoded.ID)
+		assert.Equal(t, sprint.Name, decoded.Name)
+		assert.Equal(t, sprint.State, decoded.State)
+	})
+
+	t.Run("SprintSearchResult JSON marshaling", func(t *testing.T) {
+		result := SprintSearchResult{
+			Values: []Sprint{
+				{ID: 1, Name: "Sprint 1", State: "active"},
+				{ID: 2, Name: "Sprint 2", State: "future"},
+			},
+		}
+		data, err := json.Marshal(result)
+		require.NoError(t, err)
+
+		var decoded SprintSearchResult
+		require.NoError(t, json.Unmarshal(data, &decoded))
+		assert.Len(t, decoded.Values, 2)
+		assert.Equal(t, "Sprint 1", decoded.Values[0].Name)
+	})
+
+	t.Run("Board JSON marshaling", func(t *testing.T) {
+		board := Board{ID: 1, Name: "Test Board"}
+		data, err := json.Marshal(board)
+		require.NoError(t, err)
+
+		var decoded Board
+		require.NoError(t, json.Unmarshal(data, &decoded))
+		assert.Equal(t, board.ID, decoded.ID)
+		assert.Equal(t, board.Name, decoded.Name)
+	})
+
+	t.Run("BoardSearchResult JSON marshaling", func(t *testing.T) {
+		result := BoardSearchResult{Values: []Board{{ID: 1, Name: "Board 1"}, {ID: 2, Name: "Board 2"}}}
+		data, err := json.Marshal(result)
+		require.NoError(t, err)
+
+		var decoded BoardSearchResult
+		require.NoError(t, json.Unmarshal(data, &decoded))
+		assert.Len(t, decoded.Values, 2)
+		assert.Equal(t, "Board 1", decoded.Values[0].Name)
+	})
+}
+
+func deduplicateSprints(boardSprints [][]Sprint) []Sprint {
+	allSprints := make([]Sprint, 0)
+	seenSprints := make(map[int]bool)
+	for _, sprints := range boardSprints {
+		for _, sprint := range sprints {
+			if !seenSprints[sprint.ID] {
+				seenSprints[sprint.ID] = true
+				allSprints = append(allSprints, sprint)
+			}
+		}
+	}
+	return allSprints
+}
+
+func TestSprintDeduplication(t *testing.T) {
+	t.Run("deduplicates sprints from multiple boards", func(t *testing.T) {
+		result := deduplicateSprints([][]Sprint{
+			{{ID: 1, Name: "Sprint 1", State: "active"}, {ID: 2, Name: "Sprint 2", State: "future"}},
+			{{ID: 1, Name: "Sprint 1", State: "active"}, {ID: 3, Name: "Sprint 3", State: "future"}},
+		})
+
+		data, err := json.Marshal(result)
+		require.NoError(t, err)
+
+		var decoded []Sprint
+		require.NoError(t, json.Unmarshal(data, &decoded))
+		assert.Len(t, decoded, 3)
+		assert.Equal(t, 1, decoded[0].ID)
+		assert.Equal(t, 2, decoded[1].ID)
+		assert.Equal(t, 3, decoded[2].ID)
+	})
+
+	t.Run("handles empty sprints from all boards", func(t *testing.T) {
+		result := deduplicateSprints([][]Sprint{{}, {}})
+
+		data, err := json.Marshal(result)
+		require.NoError(t, err)
+		assert.Equal(t, "[]", string(data))
+	})
+
+	t.Run("handles single board with sprints", func(t *testing.T) {
+		result := deduplicateSprints([][]Sprint{
+			{{ID: 10, Name: "Q1 Sprint", State: "active"}, {ID: 11, Name: "Q2 Sprint", State: "future"}},
+		})
+
+		data, err := json.Marshal(result)
+		require.NoError(t, err)
+
+		var decoded []Sprint
+		require.NoError(t, json.Unmarshal(data, &decoded))
+		assert.Len(t, decoded, 2)
+	})
+
+	t.Run("preserves order of first occurrence", func(t *testing.T) {
+		result := deduplicateSprints([][]Sprint{
+			{{ID: 5, Name: "Sprint 5", State: "future"}, {ID: 3, Name: "Sprint 3", State: "active"}},
+			{{ID: 3, Name: "Sprint 3", State: "active"}, {ID: 1, Name: "Sprint 1", State: "closed"}},
+		})
+
+		assert.Len(t, result, 3)
+		assert.Equal(t, 5, result[0].ID)
+		assert.Equal(t, 3, result[1].ID)
+		assert.Equal(t, 1, result[2].ID)
+	})
+}
